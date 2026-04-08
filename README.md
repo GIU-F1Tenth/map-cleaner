@@ -8,10 +8,6 @@ A small tool for cleaning occupancy grid maps (`.pgm` + `.yaml`) using segmentat
 - Uses MobileSAM for segmentation (automatic or point-based)
 - Supports **multiple point prompts** for more precise control
 - Cleans and smooths the segmented region
-- Converts the result into a 3-value occupancy grid:
-  - free: 255  
-  - occupied: 0  
-  - unknown: 205  
 - Displays a side-by-side comparison (original vs cleaned)
 - Saves the cleaned map
 
