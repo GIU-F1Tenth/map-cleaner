@@ -12,8 +12,9 @@ A small tool for cleaning occupancy grid maps (`.pgm` + `.yaml`) using segmentat
 
 ---
 
-<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/19468686-3f7a-4c00-9d09-afed146d2a93" />
-<img width="1344" height="524" alt="image" src="https://github.com/user-attachments/assets/6ada8fa5-2ac8-4967-ba87-77a2bebc3341" />
+<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/459f1fb1-d7a0-4de2-a538-d54aacd605d3" />
+<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/01489a69-eabd-4fc6-892e-4ae987062230" />
+
 
 
 
