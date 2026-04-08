@@ -1,6 +1,6 @@
 """
 map_io.py
-Handles loading and saving ROS occupancy grid files (.pgm + .yaml).
+Handles loading and saving files (.pgm + .yaml).
 """
 
 from pathlib import Path
@@ -12,7 +12,7 @@ import yaml
 
 def load_map(yaml_path: str | Path) -> tuple[np.ndarray, dict]:
     """
-    Load a ROS map from a .yaml file.
+    Load a map from a .yaml file.
     Returns (greyscale image, metadata dict).
     """
     yaml_path = Path(yaml_path)
@@ -42,30 +42,49 @@ def save_map(cleaned: np.ndarray, meta: dict, out_pgm: Path, out_yaml: Path) -> 
 
 def pgm_to_rgb(pgm: np.ndarray) -> np.ndarray:
     """Convert greyscale PGM to RGB array for SAM input."""
-    return cv2.cvtColor(pgm, cv2.COLOR_GRAY2RGB)
+    if pgm.ndim == 2:
+        rgb = cv2.cvtColor(pgm, cv2.COLOR_GRAY2RGB)
+    else:
+        rgb = pgm
+    return np.ascontiguousarray(rgb)
 
 
-def build_comparison_image(original: np.ndarray,
-                            cleaned: np.ndarray,
-                            track_mask: np.ndarray) -> np.ndarray:
+def build_comparison_image(
+    original: np.ndarray, cleaned: np.ndarray, track_mask: np.ndarray
+) -> np.ndarray:
     """
     Build a side-by-side BGR comparison: Original | Cleaned.
     The track interior is tinted green on the cleaned side.
     """
-    orig_bgr    = cv2.cvtColor(original, cv2.COLOR_GRAY2BGR)
-    cleaned_bgr = cv2.cvtColor(cleaned,  cv2.COLOR_GRAY2BGR)
+    # ensure both are grayscale before converting to BGR
+    if original.ndim == 3:
+        original = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY)
+    if cleaned.ndim == 3:
+        cleaned = cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY)
+
+    orig_bgr = cv2.cvtColor(original, cv2.COLOR_GRAY2BGR)
+    cleaned_bgr = cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR)
 
     if track_mask is not None:
+        # resize mask to match image if needed
+        if track_mask.shape != original.shape:
+            track_mask = cv2.resize(
+                track_mask,
+                (original.shape[1], original.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
         cleaned_bgr[track_mask == 1] = (180, 230, 180)
 
     h, w = original.shape
-    gap   = np.full((h, 20, 3), 160, dtype=np.uint8)
+    gap = np.full((h, 20, 3), 160, dtype=np.uint8)
     panel = np.hstack([orig_bgr, gap, cleaned_bgr])
 
-    font  = cv2.FONT_HERSHEY_SIMPLEX
+    font = cv2.FONT_HERSHEY_SIMPLEX
     scale = max(0.5, w / 800)
     thick = max(1, int(scale * 2))
-    pad   = int(10 * scale)
-    cv2.putText(panel, "Original", (pad, pad + 20),           font, scale, (0, 80, 220), thick)
-    cv2.putText(panel, "Cleaned",  (w + 20 + pad, pad + 20),  font, scale, (0, 160, 60), thick)
+    pad = int(10 * scale)
+    cv2.putText(panel, "Original", (pad, pad + 20), font, scale, (0, 80, 220), thick)
+    cv2.putText(
+        panel, "Cleaned", (w + 20 + pad, pad + 20), font, scale, (0, 160, 60), thick
+    )
     return panel

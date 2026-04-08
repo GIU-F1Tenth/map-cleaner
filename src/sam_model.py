@@ -1,88 +1,67 @@
 """
 sam_model.py
-MobileSAM model initialisation and segmentation via ultralytics.
+MobileSAM segmentation using mobile_sam package directly.
 """
 
-import numpy as np
+from pathlib import Path
 import cv2
+import numpy as np
+from config import SAM_WEIGHTS
 
 
-def init_sam(model_path: str = "mobile_sam.pt"):
-    """
-    Load MobileSAM via ultralytics.
-    Weights are auto-downloaded on first run if not present.
-    """
+def init_sam():
     try:
-        import ultralytics
-        model = ultralytics.SAM(model_path)
-        return model
+        from mobile_sam import sam_model_registry
     except ImportError:
-        raise RuntimeError("ultralytics is not installed.\n  pip install ultralytics")
-    except Exception as e:
-        raise RuntimeError(f"Failed to load SAM model: {e}")
-
-
-def segment_auto(model, image_rgb: np.ndarray,
-                 min_area_frac: float = 0.05,
-                 max_area_frac: float = 0.70) -> np.ndarray:
-    """
-    Run SAM automatic mask generation and return the mask that best represents
-    the track interior — the largest mask whose area fraction is between
-    min_area_frac and max_area_frac of the total image.
-    """
-    results = model.predict(image_rgb, retina_masks=True, imgsz=1024)
-
-    if results[0].masks is None:
-        raise ValueError("SAM returned no masks. Try using a prompt point instead.")
-
-    masks_np = results[0].masks.data.cpu().numpy()
-    total_px = image_rgb.shape[0] * image_rgb.shape[1]
-
-    best_mask, best_area = None, 0
-    for mask in masks_np:
-        area = int(mask.sum())
-        frac = area / total_px
-        if min_area_frac <= frac <= max_area_frac and area > best_area:
-            best_mask = mask
-            best_area = area
-
-    if best_mask is None:
-        raise ValueError(
-            "No qualifying mask found (area between "
-            f"{min_area_frac*100:.0f}%–{max_area_frac*100:.0f}% of image).\n"
-            "Try using a prompt point instead."
+        raise RuntimeError(
+            "mobile_sam is not installed.\n"
+            "  pip install git+https://github.com/ChaoningZhang/MobileSAM.git\n"
+            "  pip install timm"
         )
+    if not SAM_WEIGHTS.exists():
+        raise RuntimeError(
+            f"Weights not found: {SAM_WEIGHTS}\n"
+            "Please place mobile_sam.pt in the models/ folder."
+        )
+    import warnings
 
-    return best_mask.astype(np.uint8)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model = sam_model_registry["vit_t"](checkpoint=str(SAM_WEIGHTS))
+    model.eval()
+    print(f"[sam] Model loaded from {SAM_WEIGHTS}")
+    return model
 
 
-def segment_point(model, image_rgb: np.ndarray,
-                  point: tuple[int, int]) -> np.ndarray:
+def segment_points(
+    model, image_rgb: np.ndarray, points: list[tuple[int, int]]
+) -> np.ndarray:
     """
-    Run SAM with a single foreground point prompt inside the track.
-    Returns the largest mask returned for that point.
+    Point-prompted segmentation with one or more foreground points.
+    All points are passed together as a single prompt so SAM returns
+    a mask that covers all of them.
     """
-    results = model.predict(
-        image_rgb,
-        points=[list(point)],
-        labels=[1],
-        retina_masks=True,
-        imgsz=1024,
-    )
+    from mobile_sam import SamPredictor
+    import warnings
 
-    if results[0].masks is None:
-        raise ValueError(f"SAM returned no masks for point {point}.")
-
-    masks_np = results[0].masks.data.cpu().numpy()
-    best_mask = max(masks_np, key=lambda m: m.sum())
-    return best_mask.astype(np.uint8)
+    image_rgb = np.ascontiguousarray(image_rgb)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        predictor = SamPredictor(model)
+        predictor.set_image(image_rgb)
+        masks, scores, _ = predictor.predict(
+            point_coords=np.array(points),
+            point_labels=np.ones(len(points), dtype=int),
+            multimask_output=True,
+        )
+    best = masks[int(np.argmax(scores))]
+    return np.ascontiguousarray(best.astype(np.uint8))
 
 
 def resize_mask_to(mask: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
-    """Resize mask to (h, w) using nearest-neighbour to preserve binary values."""
+    mask = np.ascontiguousarray(mask)
     if mask.shape == target_shape:
         return mask
     return cv2.resize(
-        mask, (target_shape[1], target_shape[0]),
-        interpolation=cv2.INTER_NEAREST
+        mask, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_NEAREST
     )

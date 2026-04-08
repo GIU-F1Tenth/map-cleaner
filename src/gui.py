@@ -1,416 +1,525 @@
 """
 gui.py
-PyQt5 GUI for the RoboRacer map cleaner.
-Provides a file picker, parameter controls, live preview, and save button.
+RoboRacer Map Cleaner GUI using customtkinter.
 """
 
+import threading
 from pathlib import Path
 
 import cv2
+import customtkinter as ctk
 import numpy as np
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap, QFont
-from PyQt5.QtWidgets import (
-    QApplication, QFileDialog, QGroupBox, QHBoxLayout,
-    QLabel, QMainWindow, QMessageBox, QPushButton,
-    QScrollArea, QSizePolicy, QSlider, QSpinBox,
-    QStatusBar, QVBoxLayout, QWidget, QRadioButton,
-    QButtonGroup, QFrame, QCheckBox,
-)
+from PIL import Image, ImageTk
 
+from config import MAPS_DIR, OUTPUT_DIR
 from map_io import build_comparison_image, load_map, pgm_to_rgb, save_map
 from processing import derive_occupancy_grid, grid_stats
-from sam_model import init_sam, resize_mask_to, segment_auto, segment_point
+from sam_model import init_sam, resize_mask_to, segment_points
+
+ctk.set_appearance_mode("light")
+ctk.set_default_color_theme("blue")
+FONT = ("Inter", 13)
+FONT_SMALL = ("Inter", 11)
+FONT_TITLE = ("Inter", 15, "bold")
+
+POINT_COLOURS = [
+    "#e53935",
+    "#8e24aa",
+    "#1e88e5",
+    "#00897b",
+    "#f4511e",
+    "#3949ab",
+    "#00acc1",
+    "#7cb342",
+]
 
 
-# ── worker thread so the GUI doesn't freeze during SAM inference ──────────────
-
-class SegmentWorker(QThread):
-    finished  = pyqtSignal(object, object)   # (track_mask, cleaned_grid)
-    errored   = pyqtSignal(str)
-    progress  = pyqtSignal(str)
-
-    def __init__(self, model, image_rgb, original_shape,
-                 use_point, point, wall_thickness):
-        super().__init__()
-        self.model          = model
-        self.image_rgb      = image_rgb
-        self.original_shape = original_shape
-        self.use_point      = use_point
-        self.point          = point
-        self.wall_thickness = wall_thickness
-
-    def run(self):
-        try:
-            self.progress.emit("Running MobileSAM segmentation…")
-            if self.use_point:
-                mask = segment_point(self.model, self.image_rgb, self.point)
-            else:
-                mask = segment_auto(self.model, self.image_rgb)
-
-            mask    = resize_mask_to(mask, self.original_shape)
-            cleaned = derive_occupancy_grid(mask, self.wall_thickness)
-            self.finished.emit(mask, cleaned)
-        except Exception as e:
-            self.errored.emit(str(e))
-
-
-# ── main window ───────────────────────────────────────────────────────────────
-
-class MapCleanerWindow(QMainWindow):
+class MapCleanerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("RoboRacer Map Cleaner — MobileSAM")
-        self.resize(1200, 700)
+        self.title("RoboRacer Map Cleaner")
+        self.geometry("1380x820")
+        self.resizable(True, True)
 
-        self._yaml_path   = None
-        self._original    = None
-        self._meta        = None
-        self._track_mask  = None
-        self._cleaned     = None
-        self._sam_model   = None
-        self._worker      = None
+        self._yaml_path = None
+        self._original = None
+        self._meta = None
+        self._track_mask = None
+        self._cleaned = None
+        self._sam_model = None
+        self._tk_image = None
+        self._points: list[tuple[int, int]] = []  # map-space points
+        self._render_info = None
+        self._current_rgb = None
 
         self._build_ui()
 
-    # ── UI construction ───────────────────────────────────────────────────────
+    # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        root = QWidget()
-        self.setCentralWidget(root)
-        root_layout = QHBoxLayout(root)
-        root_layout.setContentsMargins(12, 12, 12, 12)
-        root_layout.setSpacing(12)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
-        # ---- left panel (controls) ------------------------------------------
-        ctrl_panel = QWidget()
-        ctrl_panel.setFixedWidth(280)
-        ctrl_layout = QVBoxLayout(ctrl_panel)
-        ctrl_layout.setSpacing(10)
+        # ---- left panel -----------------------------------------------------
+        left = ctk.CTkScrollableFrame(self, width=270, corner_radius=0)
+        left.grid(row=0, column=0, sticky="nsew")
 
-        # file picker
-        file_group = QGroupBox("Map File")
-        file_layout = QVBoxLayout(file_group)
-        self._file_label = QLabel("No file selected")
-        self._file_label.setWordWrap(True)
-        self._file_label.setStyleSheet("color: grey; font-size: 11px;")
-        browse_btn = QPushButton("Browse .yaml…")
-        browse_btn.clicked.connect(self._browse_file)
-        file_layout.addWidget(self._file_label)
-        file_layout.addWidget(browse_btn)
-        ctrl_layout.addWidget(file_group)
+        ctk.CTkLabel(left, text="Map Cleaner", font=FONT_TITLE).pack(
+            padx=16, pady=(20, 14), anchor="w"
+        )
 
-        # model weights
-        model_group = QGroupBox("MobileSAM Weights")
-        model_layout = QVBoxLayout(model_group)
-        self._model_label = QLabel("mobile_sam.pt  (auto-download)")
-        self._model_label.setStyleSheet("color: grey; font-size: 11px;")
-        self._model_label.setWordWrap(True)
-        model_browse_btn = QPushButton("Browse .pt…")
-        model_browse_btn.clicked.connect(self._browse_model)
-        self._weights_path = "mobile_sam.pt"
-        model_layout.addWidget(self._model_label)
-        model_layout.addWidget(model_browse_btn)
-        ctrl_layout.addWidget(model_group)
+        # file
+        ctk.CTkLabel(left, text="Map file", font=FONT).pack(anchor="w", padx=16)
+        self._file_label = ctk.CTkLabel(
+            left,
+            text="No file selected",
+            font=FONT_SMALL,
+            text_color="gray",
+            wraplength=250,
+            justify="left",
+        )
+        self._file_label.pack(anchor="w", padx=16, pady=(2, 6))
+        ctk.CTkButton(
+            left, text="Browse .yaml…", font=FONT, command=self._browse_file
+        ).pack(fill="x", padx=16, pady=(0, 10))
 
-        # prompt mode
-        prompt_group = QGroupBox("Prompt Mode")
-        prompt_layout = QVBoxLayout(prompt_group)
-        self._mode_auto  = QRadioButton("Auto  (SAM finds track automatically)")
-        self._mode_point = QRadioButton("Point  (click a pixel inside track)")
-        self._mode_auto.setChecked(True)
-        self._mode_group = QButtonGroup()
-        self._mode_group.addButton(self._mode_auto)
-        self._mode_group.addButton(self._mode_point)
-        prompt_layout.addWidget(self._mode_auto)
-        prompt_layout.addWidget(self._mode_point)
+        _sep(left)
 
-        point_row = QHBoxLayout()
-        point_row.addWidget(QLabel("X:"))
-        self._px_spin = QSpinBox(); self._px_spin.setRange(0, 9999); self._px_spin.setValue(320)
-        point_row.addWidget(self._px_spin)
-        point_row.addWidget(QLabel("Y:"))
-        self._py_spin = QSpinBox(); self._py_spin.setRange(0, 9999); self._py_spin.setValue(240)
-        point_row.addWidget(self._py_spin)
-        prompt_layout.addLayout(point_row)
+        _sep(left)
 
-        hint = QLabel("Tip: hover over the preview to read pixel coordinates.")
-        hint.setStyleSheet("color: grey; font-size: 10px;")
-        hint.setWordWrap(True)
-        prompt_layout.addWidget(hint)
-        ctrl_layout.addWidget(prompt_group)
+        # points list
+        ctk.CTkLabel(left, text="Prompt points", font=FONT).pack(
+            anchor="w", padx=16, pady=(10, 4)
+        )
+
+        self._points_frame = ctk.CTkScrollableFrame(
+            left, height=140, fg_color="#f5f5f5", corner_radius=6
+        )
+        self._points_frame.pack(fill="x", padx=16, pady=(0, 4))
+
+        self._no_pts_label = ctk.CTkLabel(
+            self._points_frame,
+            text="No points yet — click the preview",
+            font=FONT_SMALL,
+            text_color="gray",
+        )
+        self._no_pts_label.pack(pady=8)
+
+        ctk.CTkButton(
+            left,
+            text="Clear all points",
+            font=FONT_SMALL,
+            fg_color="#ef5350",
+            hover_color="#c62828",
+            command=self._clear_points,
+        ).pack(fill="x", padx=16, pady=(0, 10))
+
+        _sep(left)
 
         # wall thickness
-        wall_group = QGroupBox("Wall Thickness (px)")
-        wall_layout = QHBoxLayout(wall_group)
-        self._wall_spin = QSpinBox()
-        self._wall_spin.setRange(1, 10)
-        self._wall_spin.setValue(2)
-        wall_layout.addWidget(self._wall_spin)
-        wall_layout.addStretch()
-        ctrl_layout.addWidget(wall_group)
+        ctk.CTkLabel(left, text="Wall thickness (px)", font=FONT).pack(
+            anchor="w", padx=16, pady=(10, 2)
+        )
+        self._wall_var = ctk.IntVar(value=2)
+        wall_row = ctk.CTkFrame(left, fg_color="transparent")
+        wall_row.pack(fill="x", padx=16, pady=(0, 10))
+        self._wall_slider = ctk.CTkSlider(
+            wall_row,
+            from_=1,
+            to=8,
+            number_of_steps=7,
+            variable=self._wall_var,
+            command=self._on_wall_change,
+        )
+        self._wall_slider.pack(side="left", fill="x", expand=True)
+        self._wall_label = ctk.CTkLabel(wall_row, text="2", font=FONT_SMALL, width=24)
+        self._wall_label.pack(side="left", padx=(8, 0))
 
-        # run button
-        self._run_btn = QPushButton("▶  Run MobileSAM")
-        self._run_btn.setFixedHeight(42)
-        self._run_btn.setEnabled(False)
-        self._run_btn.clicked.connect(self._run_sam)
-        font = self._run_btn.font()
-        font.setPointSize(11)
-        self._run_btn.setFont(font)
-        ctrl_layout.addWidget(self._run_btn)
+        # smoothing
+        ctk.CTkLabel(left, text="Boundary smoothing (sigma)", font=FONT).pack(
+            anchor="w", padx=16, pady=(10, 2)
+        )
+        self._sigma_var = ctk.DoubleVar(value=3.0)
+        sigma_row = ctk.CTkFrame(left, fg_color="transparent")
+        sigma_row.pack(fill="x", padx=16, pady=(0, 6))
+        self._sigma_slider = ctk.CTkSlider(
+            sigma_row,
+            from_=0.5,
+            to=8.0,
+            number_of_steps=15,
+            variable=self._sigma_var,
+            command=self._on_sigma_change,
+        )
+        self._sigma_slider.pack(side="left", fill="x", expand=True)
+        self._sigma_label = ctk.CTkLabel(
+            sigma_row, text="3.0", font=FONT_SMALL, width=30
+        )
+        self._sigma_label.pack(side="left", padx=(8, 0))
 
-        # save button
-        self._save_btn = QPushButton("💾  Save Cleaned Map")
-        self._save_btn.setFixedHeight(36)
-        self._save_btn.setEnabled(False)
-        self._save_btn.clicked.connect(self._save_map)
-        ctrl_layout.addWidget(self._save_btn)
+        # min hole area
+        ctk.CTkLabel(left, text="Min noise dot area (px)", font=FONT).pack(
+            anchor="w", padx=16, pady=(4, 2)
+        )
+        self._hole_var = ctk.IntVar(value=500)
+        hole_row = ctk.CTkFrame(left, fg_color="transparent")
+        hole_row.pack(fill="x", padx=16, pady=(0, 10))
+        self._hole_slider = ctk.CTkSlider(
+            hole_row,
+            from_=50,
+            to=2000,
+            number_of_steps=19,
+            variable=self._hole_var,
+            command=self._on_hole_change,
+        )
+        self._hole_slider.pack(side="left", fill="x", expand=True)
+        self._hole_label = ctk.CTkLabel(hole_row, text="500", font=FONT_SMALL, width=40)
+        self._hole_label.pack(side="left", padx=(8, 0))
 
-        # stats label
-        self._stats_label = QLabel("")
-        self._stats_label.setStyleSheet("font-size: 11px; color: #444;")
-        self._stats_label.setWordWrap(True)
-        ctrl_layout.addWidget(self._stats_label)
+        _sep(left)
 
-        ctrl_layout.addStretch()
-        root_layout.addWidget(ctrl_panel)
+        # run / save
+        self._run_btn = ctk.CTkButton(
+            left, text="▶  Run", font=FONT, state="disabled", command=self._run_sam
+        )
+        self._run_btn.pack(fill="x", padx=16, pady=(12, 6))
 
-        # ---- divider --------------------------------------------------------
-        line = QFrame()
-        line.setFrameShape(QFrame.VLine)
-        line.setFrameShadow(QFrame.Sunken)
-        root_layout.addWidget(line)
+        self._save_btn = ctk.CTkButton(
+            left,
+            text="💾  Save map",
+            font=FONT,
+            fg_color="#2e7d32",
+            hover_color="#1b5e20",
+            state="disabled",
+            command=self._save_map,
+        )
+        self._save_btn.pack(fill="x", padx=16, pady=(0, 10))
+
+        self._stats_label = ctk.CTkLabel(
+            left,
+            text="",
+            font=FONT_SMALL,
+            text_color="gray",
+            wraplength=255,
+            justify="left",
+        )
+        self._stats_label.pack(anchor="w", padx=16)
+
+        self._status = ctk.CTkLabel(
+            left,
+            text="Ready",
+            font=FONT_SMALL,
+            text_color="gray",
+            wraplength=255,
+            justify="left",
+        )
+        self._status.pack(anchor="w", padx=16, pady=(0, 16))
 
         # ---- right panel (preview) ------------------------------------------
-        preview_panel = QWidget()
-        preview_layout = QVBoxLayout(preview_panel)
-        preview_layout.setContentsMargins(0, 0, 0, 0)
+        right = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
+        right.grid_rowconfigure(1, weight=1)
+        right.grid_columnconfigure(0, weight=1)
 
-        preview_label_row = QHBoxLayout()
-        preview_label_row.addWidget(QLabel("Preview"))
-        self._coord_label = QLabel("")
-        self._coord_label.setStyleSheet("color: grey; font-size: 11px;")
-        preview_label_row.addStretch()
-        preview_label_row.addWidget(self._coord_label)
-        preview_layout.addLayout(preview_label_row)
+        top_row = ctk.CTkFrame(right, fg_color="transparent")
+        top_row.grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(top_row, text="Preview", font=FONT).pack(side="left")
+        self._coord_label = ctk.CTkLabel(
+            top_row, text="", font=FONT_SMALL, text_color="gray"
+        )
+        self._coord_label.pack(side="right")
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        self._preview_label = _ClickableImageLabel(self._on_image_click)
-        self._preview_label.setAlignment(Qt.AlignCenter)
-        self._preview_label.setText("Open a .yaml map file to get started.")
-        self._preview_label.setStyleSheet("color: grey; font-size: 13px;")
-        self._preview_label.mouseMoveEvent = self._on_mouse_move
-        self._preview_label.setMouseTracking(True)
-        scroll.setWidget(self._preview_label)
-        preview_layout.addWidget(scroll)
+        self._canvas = ctk.CTkCanvas(right, bg="#e8e8e8", highlightthickness=0)
+        self._canvas.grid(row=1, column=0, sticky="nsew")
+        self._canvas.bind("<Configure>", self._on_canvas_resize)
+        self._canvas.bind("<Motion>", self._on_mouse_move)
+        self._canvas.bind("<Button-1>", self._on_canvas_click)
 
-        root_layout.addWidget(preview_panel, stretch=1)
+    # ── points management ─────────────────────────────────────────────────────
 
-        # status bar
-        self.setStatusBar(QStatusBar())
-        self.statusBar().showMessage("Ready")
+    def _add_point(self, mx: int, my: int):
+        self._points.append((mx, my))
+        self._rebuild_points_ui()
+        self._redraw_preview()
 
-    # ── slots ─────────────────────────────────────────────────────────────────
+    def _delete_point(self, idx: int):
+        self._points.pop(idx)
+        self._rebuild_points_ui()
+        self._redraw_preview()
+
+    def _clear_points(self):
+        self._points.clear()
+        self._rebuild_points_ui()
+        self._redraw_preview()
+
+    def _rebuild_points_ui(self):
+        for w in self._points_frame.winfo_children():
+            w.destroy()
+
+        if not self._points:
+            self._no_pts_label = ctk.CTkLabel(
+                self._points_frame,
+                text="No points yet — click the preview",
+                font=FONT_SMALL,
+                text_color="gray",
+            )
+            self._no_pts_label.pack(pady=8)
+            return
+
+        for i, (px, py) in enumerate(self._points):
+            colour = POINT_COLOURS[i % len(POINT_COLOURS)]
+            row = ctk.CTkFrame(self._points_frame, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+
+            # colour dot
+            dot = ctk.CTkLabel(
+                row, text="●", font=("Inter", 16), text_color=colour, width=24
+            )
+            dot.pack(side="left")
+
+            # coordinates
+            ctk.CTkLabel(row, text=f"x={px}  y={py}", font=FONT_SMALL).pack(
+                side="left", padx=4
+            )
+
+            # delete button
+            btn = ctk.CTkButton(
+                row,
+                text="✕",
+                width=28,
+                height=24,
+                font=FONT_SMALL,
+                fg_color="#ef5350",
+                hover_color="#c62828",
+                command=lambda i=i: self._delete_point(i),
+            )
+            btn.pack(side="right", padx=4)
+
+    # ── callbacks ─────────────────────────────────────────────────────────────
+
+    def _on_wall_change(self, val):
+        self._wall_label.configure(text=str(int(float(val))))
+
+    def _on_sigma_change(self, val):
+        self._sigma_label.configure(text=f"{float(val):.1f}")
+
+    def _on_hole_change(self, val):
+        self._hole_label.configure(text=str(int(float(val))))
 
     def _browse_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Map YAML", "", "YAML files (*.yaml *.yml)"
+        from tkinter import filedialog
+
+        path = filedialog.askopenfilename(
+            initialdir=str(MAPS_DIR),
+            title="Open map YAML",
+            filetypes=[("YAML files", "*.yaml *.yml"), ("All files", "*.*")],
         )
         if not path:
             return
         self._yaml_path = Path(path)
-        self._file_label.setText(self._yaml_path.name)
-        self._file_label.setStyleSheet("font-size: 11px;")
+        self._file_label.configure(text=self._yaml_path.name, text_color="white")
         try:
             self._original, self._meta = load_map(self._yaml_path)
         except Exception as e:
-            QMessageBox.critical(self, "Load Error", str(e))
+            self._status.configure(text=f"Error: {e}")
             return
         self._track_mask = None
-        self._cleaned    = None
-        self._show_original()
-        self._run_btn.setEnabled(True)
-        self._save_btn.setEnabled(False)
-        self._stats_label.setText("")
-        self.statusBar().showMessage(f"Loaded: {self._yaml_path.name}  "
-                                     f"({self._original.shape[1]}×{self._original.shape[0]})")
-
-    def _browse_model(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select MobileSAM weights", "", "PyTorch weights (*.pt)"
+        self._cleaned = None
+        self._points.clear()
+        self._rebuild_points_ui()
+        self._current_rgb = cv2.cvtColor(self._original, cv2.COLOR_GRAY2RGB)
+        self._render_to_canvas()
+        self._run_btn.configure(state="normal")
+        self._save_btn.configure(state="disabled")
+        self._stats_label.configure(text="")
+        self._status.configure(
+            text=f"{self._original.shape[1]}×{self._original.shape[0]} px"
         )
-        if path:
-            self._weights_path = path
-            self._model_label.setText(Path(path).name)
-            self._model_label.setStyleSheet("font-size: 11px;")
-            self._sam_model = None  # force reload
 
     def _run_sam(self):
         if self._original is None:
             return
+        if not self._points:
+            self._status.configure(text="Add at least one point first.")
+            return
 
-        # lazy-load model
-        if self._sam_model is None:
-            self.statusBar().showMessage("Loading MobileSAM model…")
-            QApplication.processEvents()
+        self._run_btn.configure(state="disabled", text="Running…")
+        self._status.configure(text="Loading MobileSAM…")
+
+        def worker():
             try:
-                self._sam_model = init_sam(self._weights_path)
-            except RuntimeError as e:
-                QMessageBox.critical(self, "Model Error", str(e))
-                return
+                if self._sam_model is None:
+                    self._sam_model = init_sam()
+                self._status.configure(text="Segmenting…")
+                image_rgb = pgm_to_rgb(self._original)
+                mask = segment_points(self._sam_model, image_rgb, self._points)
+                mask = resize_mask_to(mask, self._original.shape)
+                cleaned = derive_occupancy_grid(
+                    mask,
+                    self._original,
+                    self._wall_var.get(),
+                    self._sigma_var.get(),
+                    self._hole_var.get(),
+                )
+                self.after(0, self._on_done, mask, cleaned)
+            except Exception as e:
+                import traceback
 
-        use_point = self._mode_point.isChecked()
-        point     = (self._px_spin.value(), self._py_spin.value())
+                traceback.print_exc()
+                self.after(0, self._on_error, str(e))
 
-        image_rgb = pgm_to_rgb(self._original)
+        threading.Thread(target=worker, daemon=True).start()
 
-        self._run_btn.setEnabled(False)
-        self._save_btn.setEnabled(False)
-        self._worker = SegmentWorker(
-            self._sam_model, image_rgb, self._original.shape,
-            use_point, point, self._wall_spin.value()
-        )
-        self._worker.progress.connect(self.statusBar().showMessage)
-        self._worker.finished.connect(self._on_segment_done)
-        self._worker.errored.connect(self._on_segment_error)
-        self._worker.start()
-
-    def _on_segment_done(self, track_mask, cleaned):
-        self._track_mask = track_mask
-        self._cleaned    = cleaned
-        self._show_comparison()
-        self._run_btn.setEnabled(True)
-        self._save_btn.setEnabled(True)
+    def _on_done(self, mask, cleaned):
+        self._track_mask = mask
+        self._cleaned = cleaned
+        comparison = build_comparison_image(self._original, cleaned, mask)
+        self._current_rgb = cv2.cvtColor(comparison, cv2.COLOR_BGR2RGB)
+        self._render_to_canvas()
+        self._run_btn.configure(state="normal", text="▶  Run")
+        self._save_btn.configure(state="normal")
         stats = grid_stats(cleaned)
-        self._stats_label.setText(
-            f"free {stats['free']}%   occupied {stats['occupied']}%   unknown {stats['unknown']}%"
+        self._stats_label.configure(
+            text=f"free {stats['free']}%   occ {stats['occupied']}%   unk {stats['unknown']}%"
         )
-        self.statusBar().showMessage("Done. Review the preview then save.")
+        self._status.configure(text="Done — review then save.")
 
-    def _on_segment_error(self, msg):
-        self._run_btn.setEnabled(True)
-        QMessageBox.critical(self, "Segmentation Error", msg)
-        self.statusBar().showMessage("Error during segmentation.")
+    def _on_error(self, msg):
+        self._run_btn.configure(state="normal", text="▶  Run")
+        self._status.configure(text=f"Error: {msg[:120]}")
+        from tkinter import messagebox
+
+        messagebox.showerror("Segmentation Error", msg)
 
     def _save_map(self):
-        if self._cleaned is None or self._yaml_path is None:
-            return
-        stem = self._yaml_path.stem
-        default_pgm = str(self._yaml_path.with_name(f"{stem}_sam_cleaned.pgm"))
-        pgm_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Cleaned PGM", default_pgm, "PGM files (*.pgm)"
-        )
-        if not pgm_path:
-            return
-        out_pgm  = Path(pgm_path)
-        out_yaml = out_pgm.with_suffix(".yaml")
-        out_png  = out_pgm.with_name(out_pgm.stem + "_preview.png")
-        try:
-            save_map(self._cleaned, self._meta, out_pgm, out_yaml)
-            # also save comparison PNG
-            comparison = build_comparison_image(self._original, self._cleaned, self._track_mask)
-            cv2.imwrite(str(out_png), comparison)
-        except Exception as e:
-            QMessageBox.critical(self, "Save Error", str(e))
-            return
-        QMessageBox.information(
-            self, "Saved",
-            f"Saved:\n  {out_pgm.name}\n  {out_yaml.name}\n  {out_png.name}"
-        )
-        self.statusBar().showMessage(f"Saved to {out_pgm.parent}")
-
-    def _on_image_click(self, x_label, y_label):
-        """Translate click on the preview label to map pixel coords and fill spinboxes."""
-        mx, my = self._label_to_map_coords(x_label, y_label)
-        if mx is not None:
-            self._px_spin.setValue(mx)
-            self._py_spin.setValue(my)
-            self._mode_point.setChecked(True)
-
-    def _on_mouse_move(self, event):
-        mx, my = self._label_to_map_coords(event.x(), event.y())
-        if mx is not None:
-            self._coord_label.setText(f"x={mx}  y={my}")
-
-    def _label_to_map_coords(self, lx, ly):
-        """Convert label-relative pixel coords to original map coords."""
-        if self._original is None or self._pixmap is None:
-            return None, None
-        pw = self._pixmap.width()
-        ph = self._pixmap.height()
-        lw = self._preview_label.width()
-        lh = self._preview_label.height()
-        # image is centred in label
-        ox = (lw - pw) // 2
-        oy = (lh - ph) // 2
-        ix = lx - ox
-        iy = ly - oy
-        if ix < 0 or iy < 0 or ix >= pw or iy >= ph:
-            return None, None
-        # the pixmap shows the comparison (2*w+20), left half = original
-        # but we want map coords relative to original image width
-        orig_w = self._original.shape[1]
-        orig_h = self._original.shape[0]
-        panel_w = pw  # full comparison width in display pixels
-        # scale from display to full-res comparison
-        full_w = orig_w * 2 + 20
-        scale  = full_w / panel_w
-        fx = int(ix * scale)
-        fy = int(iy * (orig_h / ph))
-        # left half of comparison = original image
-        if fx > orig_w:
-            fx = fx - orig_w - 20  # right half = cleaned image, still same coords
-        fx = max(0, min(fx, orig_w - 1))
-        fy = max(0, min(fy, orig_h - 1))
-        return fx, fy
-
-    # ── preview helpers ───────────────────────────────────────────────────────
-
-    def _show_original(self):
-        if self._original is None:
-            return
-        bgr = cv2.cvtColor(self._original, cv2.COLOR_GRAY2BGR)
-        self._pixmap = self._bgr_to_pixmap(bgr)
-        self._preview_label.setPixmap(
-            self._pixmap.scaled(self._preview_label.size(),
-                                Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        )
-
-    def _show_comparison(self):
         if self._cleaned is None:
             return
-        comparison = build_comparison_image(self._original, self._cleaned, self._track_mask)
-        self._pixmap = self._bgr_to_pixmap(comparison)
-        self._preview_label.setPixmap(
-            self._pixmap.scaled(self._preview_label.size(),
-                                Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        from tkinter import filedialog
+
+        stem = self._yaml_path.stem
+        path = filedialog.asksaveasfilename(
+            initialdir=str(OUTPUT_DIR),
+            initialfile=f"{stem}_sam_cleaned.pgm",
+            filetypes=[("PGM files", "*.pgm")],
+        )
+        if not path:
+            return
+        out_pgm = Path(path)
+        out_yaml = out_pgm.with_suffix(".yaml")
+        out_png = out_pgm.with_name(out_pgm.stem + "_preview.png")
+        save_map(self._cleaned, self._meta, out_pgm, out_yaml)
+        comparison = build_comparison_image(
+            self._original, self._cleaned, self._track_mask
+        )
+        cv2.imwrite(str(out_png), comparison)
+        self._status.configure(text=f"Saved to {out_pgm.parent}")
+        from tkinter import messagebox
+
+        messagebox.showinfo(
+            "Saved", f"Saved:\n  {out_pgm.name}\n  {out_yaml.name}\n  {out_png.name}"
         )
 
-    @staticmethod
-    def _bgr_to_pixmap(bgr: np.ndarray) -> QPixmap:
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-        return QPixmap.fromImage(qimg)
+    # ── preview ───────────────────────────────────────────────────────────────
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if hasattr(self, "_pixmap") and self._pixmap:
-            self._preview_label.setPixmap(
-                self._pixmap.scaled(self._preview_label.size(),
-                                    Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    def _redraw_preview(self):
+        """Re-render current image with point markers overlaid."""
+        if self._current_rgb is None:
+            return
+        display = self._current_rgb.copy()
+        if self._render_info and self._points:
+            scale = self._render_info["scale"]
+            orig_w = (
+                self._original.shape[1]
+                if self._original is not None
+                else display.shape[1]
             )
+            for i, (px, py) in enumerate(self._points):
+                colour_hex = POINT_COLOURS[i % len(POINT_COLOURS)]
+                colour_bgr = _hex_to_bgr(colour_hex)
+                # draw on display image directly — convert map coords to display coords
+                dx = int(px)
+                dy = int(py)
+                cv2.circle(display, (dx, dy), 10, colour_bgr, -1)
+                cv2.circle(display, (dx, dy), 10, (255, 255, 255), 2)
+                cv2.circle(display, (dx, dy), 3, (255, 255, 255), -1)
+                cv2.putText(
+                    display,
+                    str(i + 1),
+                    (dx + 13, dy + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    colour_bgr,
+                    2,
+                )
+        self._show_image(display)
+
+    def _show_image(self, rgb: np.ndarray):
+        cw = self._canvas.winfo_width()
+        ch = self._canvas.winfo_height()
+        if cw < 10 or ch < 10:
+            return
+        ih, iw = rgb.shape[:2]
+        scale = min(cw / iw, ch / ih)
+        nw, nh = int(iw * scale), int(ih * scale)
+        resized = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
+        pil_img = Image.fromarray(resized)
+        self._tk_image = ImageTk.PhotoImage(pil_img)
+        self._canvas.delete("all")
+        self._canvas.create_image(
+            cw // 2, ch // 2, anchor="center", image=self._tk_image
+        )
+        self._render_info = {
+            "scale": scale,
+            "nw": nw,
+            "nh": nh,
+            "ox": (cw - nw) // 2,
+            "oy": (ch - nh) // 2,
+            "orig_w": rgb.shape[1],
+            "orig_h": rgb.shape[0],
+        }
+
+    def _render_to_canvas(self):
+        if self._current_rgb is not None:
+            self._redraw_preview()
+
+    def _on_canvas_resize(self, event):
+        self._render_to_canvas()
+
+    def _canvas_to_map(self, cx, cy):
+        if not self._render_info or self._original is None:
+            return None, None
+        r = self._render_info
+        ix = cx - r["ox"]
+        iy = cy - r["oy"]
+        if ix < 0 or iy < 0 or ix >= r["nw"] or iy >= r["nh"]:
+            return None, None
+        mx = int(ix / r["scale"])
+        my = int(iy / r["scale"])
+        orig_w = self._original.shape[1]
+        if mx >= orig_w:
+            mx = mx - orig_w - 20
+        mx = max(0, min(mx, orig_w - 1))
+        my = max(0, min(my, self._original.shape[0] - 1))
+        return mx, my
+
+    def _on_mouse_move(self, event):
+        mx, my = self._canvas_to_map(event.x, event.y)
+        if mx is not None:
+            self._coord_label.configure(text=f"x={mx}  y={my}")
+
+    def _on_canvas_click(self, event):
+        mx, my = self._canvas_to_map(event.x, event.y)
+        if mx is not None:
+            self._add_point(mx, my)
 
 
-class _ClickableImageLabel(QLabel):
-    def __init__(self, click_cb):
-        super().__init__()
-        self._click_cb = click_cb
-        self.setMouseTracking(True)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+# ── helpers ───────────────────────────────────────────────────────────────────
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._click_cb(event.x(), event.y())
+
+def _sep(parent):
+    ctk.CTkFrame(parent, height=1, fg_color="#e0e0e0").pack(fill="x", padx=16, pady=4)
+
+
+def _hex_to_bgr(hex_colour: str) -> tuple[int, int, int]:
+    h = hex_colour.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return (b, g, r)
