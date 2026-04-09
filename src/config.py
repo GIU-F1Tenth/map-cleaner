@@ -1,14 +1,12 @@
 """
 config.py
 Loads the .env file and exposes all project paths as resolved absolute Paths.
-ROOT is always the project root (one level above src/).
 """
 
 from pathlib import Path
 from dotenv import load_dotenv
 import os
 
-# ROOT is src/ — where all the code and subdirectories live
 ROOT = Path(__file__).parent.resolve()
 
 # Load .env from src/
