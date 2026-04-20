@@ -6,7 +6,9 @@ MobileSAM segmentation using mobile_sam package directly.
 from pathlib import Path
 import cv2
 import numpy as np
+import urllib
 from config import SAM_WEIGHTS
+from config import SAM_WEIGHTS, SAM_WEIGHTS_URL
 
 
 def init_sam():
@@ -18,11 +20,13 @@ def init_sam():
             "  pip install git+https://github.com/ChaoningZhang/MobileSAM.git\n"
             "  pip install timm"
         )
+
     if not SAM_WEIGHTS.exists():
-        raise RuntimeError(
-            f"Weights not found: {SAM_WEIGHTS}\n"
-            "Please place mobile_sam.pt in the models/ folder."
-        )
+        print(f"[sam] Weights not found, downloading to {SAM_WEIGHTS}...")
+        SAM_WEIGHTS.parent.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(SAM_WEIGHTS_URL, SAM_WEIGHTS)
+        print("[sam] Download complete.")
+
     import warnings
 
     with warnings.catch_warnings():

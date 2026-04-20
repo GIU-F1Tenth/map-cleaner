@@ -1,24 +1,21 @@
 """
 config.py
-Loads the .env file and exposes all project paths as resolved absolute Paths.
+Exposes all project paths as resolved absolute Paths.
 """
 
 from pathlib import Path
-from dotenv import load_dotenv
-import os
 
 ROOT = Path(__file__).parent.resolve()
 
-# Load .env from src/
-load_dotenv(ROOT / ".env")
-
 # ── resolved absolute paths ───────────────────────────────────────────────────
 
-MODELS_DIR: Path = (ROOT / os.getenv("MODELS_DIR", "models")).resolve()
-SAM_WEIGHTS: Path = MODELS_DIR / os.getenv("SAM_WEIGHTS", "mobile_sam.pt")
-MAPS_DIR: Path = (ROOT / os.getenv("MAPS_DIR", "maps")).resolve()
-OUTPUT_DIR: Path = (ROOT / os.getenv("OUTPUT_DIR", "maps")).resolve()
-
+MODELS_DIR: Path = (ROOT / "models").resolve()
+SAM_WEIGHTS: Path = MODELS_DIR / "mobile_sam.pt"
+MAPS_DIR: Path = (ROOT / "maps").resolve()
+OUTPUT_DIR: Path = (ROOT / "maps").resolve()
+SAM_WEIGHTS_URL = (
+    "https://github.com/ChaoningZhang/MobileSAM/raw/master/weights/mobile_sam.pt"
+)
 # Create directories if they don't exist yet
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 MAPS_DIR.mkdir(parents=True, exist_ok=True)
