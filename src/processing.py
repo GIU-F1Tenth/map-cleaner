@@ -103,28 +103,14 @@ def derive_occupancy_grid_and_mask(
     )
     smooth_mask = (blurred > 0.5).astype(np.uint8)
 
-    clip_barrier = _border_clip_barrier(
-        source_gray, smooth_mask, min_hole_area, manual_wall_mask
-    )
     cleanup_barrier = _temporary_cleanup_barrier(
         source_gray, smooth_mask, wall_thickness, min_hole_area, manual_wall_mask
     )
     outside = _outside_reachable_from_edges(cleanup_barrier)
     inside_mask = ((smooth_mask == 1) & (outside == 0)).astype(np.uint8)
-    fitted_mask = _fit_mask_to_borders(
-        smooth_mask, clip_barrier, wall_thickness, seed_points
-    )
-    if np.count_nonzero(fitted_mask) > 0:
-        if np.count_nonzero(inside_mask) > 0:
-            merged_mask = ((inside_mask == 1) & (fitted_mask == 1)).astype(np.uint8)
-            merged_count = np.count_nonzero(merged_mask)
-            fitted_count = np.count_nonzero(fitted_mask)
-            min_merged_count = max(10, int(fitted_count * 0.25))
-            inside_mask = (
-                merged_mask if merged_count >= min_merged_count else fitted_mask
-            )
-        else:
-            inside_mask = fitted_mask
+    min_inside_count = max(10, int(np.count_nonzero(smooth_mask) * 0.1))
+    if np.count_nonzero(inside_mask) < min_inside_count:
+        inside_mask = smooth_mask.copy()
 
     inside_mask = _keep_seeded_or_largest_component(inside_mask, seed_points)
 
@@ -133,15 +119,11 @@ def derive_occupancy_grid_and_mask(
     )
     final_free = ((inside_mask == 1) & (preserved_structures == 0)).astype(np.uint8)
     final_free[manual_free_mask == 1] = 1
-    final_free[manual_helper_mask == 1] = 0
     final_free = _keep_seeded_or_largest_component(final_free, seed_points)
-    helper_free_mask = _helper_free_fill_mask(
-        manual_helper_mask, final_free, inside_mask
-    )
     helper_clearance = _helper_output_clearance(manual_helper_mask, wall_thickness)
-    helper_fill_zone = (
-        (helper_clearance == 1) & ((inside_mask == 1) | (helper_free_mask == 1))
-    ).astype(np.uint8)
+    helper_fill_zone = _helper_fill_zone(helper_clearance, final_free, inside_mask)
+    final_free[helper_fill_zone == 1] = 1
+    final_free = _keep_seeded_or_largest_component(final_free, seed_points)
 
     # wall boundary ring
     k_size = wall_thickness * 2 + 1
@@ -150,7 +132,8 @@ def derive_occupancy_grid_and_mask(
     wall = ((dilated == 1) & (final_free == 0)).astype(np.uint8)
     preserved_clearance = cv2.dilate(preserved_structures, kernel, iterations=1)
     wall[(preserved_clearance == 1) & (preserved_structures == 0)] = 0
-    wall[helper_clearance == 1] = 0
+    wider_helper_clearance = helper_clearance
+    wall[wider_helper_clearance == 1] = 0
     preserved_structures[helper_clearance == 1] = 0
 
     # build grid
@@ -159,8 +142,8 @@ def derive_occupancy_grid_and_mask(
     out[final_free == 1] = FREE
     out[wall == 1] = OCCUPIED
     out[(preserved_structures == 1) & (original_gray <= 64)] = OCCUPIED
-    out[helper_clearance == 1] = UNKNOWN
-    out[helper_fill_zone == 1] = FREE
+    out[wider_helper_clearance == 1] = UNKNOWN
+    out[(final_free == 1) & (wider_helper_clearance == 1)] = FREE
     out[manual_unknown_mask == 1] = UNKNOWN
     out[(manual_free_mask == 1) & (final_free == 1)] = FREE
 
@@ -180,37 +163,6 @@ def _as_mask(mask: np.ndarray | None, shape: tuple[int, int]) -> np.ndarray:
     if mask.shape != shape:
         mask = cv2.resize(mask, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
     return mask
-
-
-def _border_clip_barrier(
-    original: np.ndarray,
-    candidate_mask: np.ndarray,
-    min_area: int,
-    manual_walls: np.ndarray,
-) -> np.ndarray:
-    barrier = _significant_original_structures(original, candidate_mask, min_area)
-    barrier[manual_walls == 1] = 1
-    return (barrier == 1).astype(np.uint8)
-
-
-def _fit_mask_to_borders(
-    candidate_mask: np.ndarray,
-    border_mask: np.ndarray,
-    wall_thickness: int,
-    seed_points: Sequence[tuple[int, int]] | None,
-) -> np.ndarray:
-    if np.count_nonzero(candidate_mask) == 0:
-        return candidate_mask.copy()
-
-    snap_radius = max(3, min(14, wall_thickness * 3 + 4))
-    snap_size = snap_radius * 2 + 1
-    snap_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (snap_size, snap_size)
-    )
-    snapped_borders = cv2.dilate(border_mask, snap_kernel, iterations=1)
-    clipped_mask = ((candidate_mask == 1) & (snapped_borders == 0)).astype(np.uint8)
-
-    return _keep_seeded_or_largest_component(clipped_mask, seed_points)
 
 
 def _keep_seeded_or_largest_component(
@@ -264,29 +216,24 @@ def _keep_seeded_or_largest_component(
     return keep
 
 
-def _helper_free_fill_mask(
-    helper_mask: np.ndarray,
+def _helper_fill_zone(
+    helper_clearance: np.ndarray,
     final_free: np.ndarray,
     inside_mask: np.ndarray,
 ) -> np.ndarray:
     num_labels, labels, _, _ = cv2.connectedComponentsWithStats(
-        helper_mask, connectivity=8
+        helper_clearance, connectivity=8
     )
-    keep = np.zeros_like(helper_mask, dtype=np.uint8)
+    keep = np.zeros_like(helper_clearance, dtype=np.uint8)
     if num_labels <= 1:
         return keep
 
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    outside = inside_mask == 0
+    nearby_free = cv2.dilate(final_free, kernel, iterations=1) == 1
     for label in range(1, num_labels):
         component = (labels == label).astype(np.uint8)
-        border = (cv2.dilate(component, kernel, iterations=1) == 1) & (
-            component == 0
-        )
-        touches_free = np.any(border & (final_free == 1))
-        touches_outside = np.any(border & outside)
-        if touches_free and not touches_outside:
-            keep[component == 1] = 1
+        if np.any((component == 1) & nearby_free):
+            keep[(component == 1) & (inside_mask == 1)] = 1
 
     return keep
 
@@ -295,7 +242,7 @@ def _helper_output_clearance(helper_mask: np.ndarray, wall_thickness: int) -> np
     if np.count_nonzero(helper_mask) == 0:
         return helper_mask.copy()
 
-    radius = max(2, min(12, wall_thickness * 2 + 3))
+    radius = max(8, min(28, wall_thickness * 6 + 10))
     size = radius * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
     return cv2.dilate(helper_mask, kernel, iterations=1).astype(np.uint8)
