@@ -13,7 +13,7 @@ from PIL import Image, ImageTk
 
 from config import MAPS_DIR, OUTPUT_DIR
 from map_io import build_comparison_image, load_map, pgm_to_rgb, save_map
-from processing import derive_occupancy_grid, grid_stats
+from processing import derive_occupancy_grid_and_mask, grid_stats
 from sam_model import init_sam, resize_mask_to, segment_points
 
 ctk.set_appearance_mode("light")
@@ -51,6 +51,10 @@ class MapCleanerApp(ctk.CTk):
         self._points: list[tuple[int, int]] = []  # map-space points
         self._render_info = None
         self._current_rgb = None
+        self._manual_walls = None
+        self._manual_unknown = None
+        self._manual_free = None
+        self._last_paint_xy = None
 
         self._build_ui()
 
@@ -112,6 +116,69 @@ class MapCleanerApp(ctk.CTk):
             fg_color="#ef5350",
             hover_color="#c62828",
             command=self._clear_points,
+        ).pack(fill="x", padx=16, pady=(0, 10))
+
+        _sep(left)
+
+        # canvas mode / manual walls
+        ctk.CTkLabel(left, text="Canvas mode", font=FONT).pack(
+            anchor="w", padx=16, pady=(10, 4)
+        )
+        self._canvas_mode_var = ctk.StringVar(value="Points")
+        self._canvas_mode = ctk.CTkSegmentedButton(
+            left,
+            values=["Points", "Paint", "Unpaint", "Gray", "White"],
+            variable=self._canvas_mode_var,
+            command=self._on_canvas_mode_change,
+            font=FONT_SMALL,
+        )
+        self._canvas_mode.pack(fill="x", padx=16, pady=(0, 10))
+
+        ctk.CTkLabel(left, text="Brush size (px)", font=FONT).pack(
+            anchor="w", padx=16, pady=(0, 2)
+        )
+        self._brush_var = ctk.IntVar(value=2)
+        brush_row = ctk.CTkFrame(left, fg_color="transparent")
+        brush_row.pack(fill="x", padx=16, pady=(0, 8))
+        self._brush_slider = ctk.CTkSlider(
+            brush_row,
+            from_=1,
+            to=10,
+            number_of_steps=9,
+            variable=self._brush_var,
+            command=self._on_brush_change,
+        )
+        self._brush_slider.pack(side="left", fill="x", expand=True)
+        self._brush_label = ctk.CTkLabel(
+            brush_row, text="2", font=FONT_SMALL, width=32
+        )
+        self._brush_label.pack(side="left", padx=(8, 0))
+
+        ctk.CTkButton(
+            left,
+            text="Clear painted walls",
+            font=FONT_SMALL,
+            fg_color="#616161",
+            hover_color="#424242",
+            command=self._clear_manual_walls,
+        ).pack(fill="x", padx=16, pady=(0, 10))
+
+        ctk.CTkButton(
+            left,
+            text="Clear gray edits",
+            font=FONT_SMALL,
+            fg_color="#616161",
+            hover_color="#424242",
+            command=self._clear_manual_unknown,
+        ).pack(fill="x", padx=16, pady=(0, 10))
+
+        ctk.CTkButton(
+            left,
+            text="Clear white edits",
+            font=FONT_SMALL,
+            fg_color="#616161",
+            hover_color="#424242",
+            command=self._clear_manual_free,
         ).pack(fill="x", padx=16, pady=(0, 10))
 
         _sep(left)
@@ -233,6 +300,8 @@ class MapCleanerApp(ctk.CTk):
         self._canvas.bind("<Configure>", self._on_canvas_resize)
         self._canvas.bind("<Motion>", self._on_mouse_move)
         self._canvas.bind("<Button-1>", self._on_canvas_click)
+        self._canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self._canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
 
     # ── points management ─────────────────────────────────────────────────────
 
@@ -250,6 +319,154 @@ class MapCleanerApp(ctk.CTk):
         self._points.clear()
         self._rebuild_points_ui()
         self._redraw_preview()
+
+    def _clear_manual_walls(self):
+        if self._manual_walls is None:
+            return
+        self._manual_walls.fill(0)
+        self._last_paint_xy = None
+        self._mark_manual_edits_changed()
+        self._redraw_preview()
+
+    def _clear_manual_unknown(self):
+        if self._manual_unknown is None:
+            return
+        self._manual_unknown.fill(0)
+        self._last_paint_xy = None
+        self._mark_manual_edits_changed()
+        self._redraw_preview()
+
+    def _clear_manual_free(self):
+        if self._manual_free is None:
+            return
+        self._manual_free.fill(0)
+        self._last_paint_xy = None
+        self._mark_manual_edits_changed()
+        self._redraw_preview()
+
+    def _paint_manual_wall(self, mx: int, my: int, erase: bool):
+        if self._manual_walls is None:
+            return
+
+        start = self._last_paint_xy
+        self._paint_mask(
+            self._manual_walls, mx, my, value=0 if erase else 1, start_point=start
+        )
+        if not erase and self._manual_unknown is not None:
+            self._paint_mask(
+                self._manual_unknown,
+                mx,
+                my,
+                value=0,
+                update_last=False,
+                start_point=start,
+            )
+        if not erase and self._manual_free is not None:
+            self._paint_mask(
+                self._manual_free,
+                mx,
+                my,
+                value=0,
+                update_last=False,
+                start_point=start,
+            )
+        self._mark_manual_edits_changed()
+        self._redraw_preview()
+
+    def _paint_manual_unknown(self, mx: int, my: int):
+        if self._manual_unknown is None:
+            return
+
+        start = self._last_paint_xy
+        self._paint_mask(self._manual_unknown, mx, my, value=1, start_point=start)
+        if self._manual_walls is not None:
+            self._paint_mask(
+                self._manual_walls,
+                mx,
+                my,
+                value=0,
+                update_last=False,
+                start_point=start,
+            )
+        if self._manual_free is not None:
+            self._paint_mask(
+                self._manual_free,
+                mx,
+                my,
+                value=0,
+                update_last=False,
+                start_point=start,
+            )
+        self._mark_manual_edits_changed()
+        self._redraw_preview()
+
+    def _paint_manual_free(self, mx: int, my: int):
+        if self._manual_free is None:
+            return
+
+        start = self._last_paint_xy
+        self._paint_mask(self._manual_free, mx, my, value=1, start_point=start)
+        if self._manual_walls is not None:
+            self._paint_mask(
+                self._manual_walls,
+                mx,
+                my,
+                value=0,
+                update_last=False,
+                start_point=start,
+            )
+        if self._manual_unknown is not None:
+            self._paint_mask(
+                self._manual_unknown,
+                mx,
+                my,
+                value=0,
+                update_last=False,
+                start_point=start,
+            )
+        self._mark_manual_edits_changed()
+        self._redraw_preview()
+
+    def _paint_mask(
+        self,
+        mask: np.ndarray,
+        mx: int,
+        my: int,
+        value: int,
+        update_last=True,
+        start_point=None,
+    ):
+        brush = max(1, int(self._brush_var.get()))
+        point = (int(mx), int(my))
+        start = point if start_point is None else start_point
+        cv2.line(mask, start, point, value, brush, lineType=cv2.LINE_8)
+
+        if update_last:
+            self._last_paint_xy = point
+
+    def _mark_manual_edits_changed(self):
+        self._cleaned = None
+        self._save_btn.configure(state="disabled")
+        self._stats_label.configure(text="")
+        self._status.configure(
+            text="Manual edits changed. Run again to apply."
+        )
+
+    def _original_with_manual_edits(self):
+        has_walls = self._manual_walls is not None and np.any(self._manual_walls)
+        has_unknown = self._manual_unknown is not None and np.any(self._manual_unknown)
+        has_free = self._manual_free is not None and np.any(self._manual_free)
+        if not has_walls and not has_unknown and not has_free:
+            return self._original
+
+        original = self._original.copy()
+        if has_unknown:
+            original[self._manual_unknown == 1] = 205
+        if has_free:
+            original[self._manual_free == 1] = 255
+        if has_walls:
+            original[self._manual_walls == 1] = 0
+        return original
 
     def _rebuild_points_ui(self):
         for w in self._points_frame.winfo_children():
@@ -305,6 +522,24 @@ class MapCleanerApp(ctk.CTk):
     def _on_hole_change(self, val):
         self._hole_label.configure(text=str(int(float(val))))
 
+    def _on_brush_change(self, val):
+        self._brush_label.configure(text=str(int(float(val))))
+
+    def _on_canvas_mode_change(self, mode):
+        self._last_paint_xy = None
+        if self._original is None:
+            return
+        if mode == "Points":
+            self._status.configure(text="Click the preview to add prompt points.")
+        elif mode == "Paint":
+            self._status.configure(text="Drag on the preview to paint wall closures.")
+        elif mode == "Unpaint":
+            self._status.configure(text="Drag on the preview to erase painted walls.")
+        elif mode == "Gray":
+            self._status.configure(text="Drag on the preview to gray out map pixels.")
+        else:
+            self._status.configure(text="Drag on the preview to paint free space.")
+
     def _browse_file(self):
         from tkinter import filedialog
 
@@ -324,6 +559,10 @@ class MapCleanerApp(ctk.CTk):
             return
         self._track_mask = None
         self._cleaned = None
+        self._manual_walls = np.zeros_like(self._original, dtype=np.uint8)
+        self._manual_unknown = np.zeros_like(self._original, dtype=np.uint8)
+        self._manual_free = np.zeros_like(self._original, dtype=np.uint8)
+        self._last_paint_xy = None
         self._points.clear()
         self._rebuild_points_ui()
         self._current_rgb = cv2.cvtColor(self._original, cv2.COLOR_GRAY2RGB)
@@ -350,17 +589,21 @@ class MapCleanerApp(ctk.CTk):
                 if self._sam_model is None:
                     self._sam_model = init_sam()
                 self._status.configure(text="Segmenting…")
-                image_rgb = pgm_to_rgb(self._original)
+                image_rgb = pgm_to_rgb(self._original_with_manual_edits())
                 mask = segment_points(self._sam_model, image_rgb, self._points)
                 mask = resize_mask_to(mask, self._original.shape)
-                cleaned = derive_occupancy_grid(
+                cleaned, fitted_mask = derive_occupancy_grid_and_mask(
                     mask,
                     self._original,
                     self._wall_var.get(),
                     self._sigma_var.get(),
                     self._hole_var.get(),
+                    self._manual_walls,
+                    self._manual_unknown,
+                    self._manual_free,
+                    self._points,
                 )
-                self.after(0, self._on_done, mask, cleaned)
+                self.after(0, self._on_done, fitted_mask, cleaned)
             except Exception as e:
                 import traceback
 
@@ -425,6 +668,7 @@ class MapCleanerApp(ctk.CTk):
         if self._current_rgb is None:
             return
         display = self._current_rgb.copy()
+        self._draw_manual_edits_overlay(display)
         if self._render_info and self._points:
             scale = self._render_info["scale"]
             orig_w = (
@@ -451,6 +695,33 @@ class MapCleanerApp(ctk.CTk):
                     2,
                 )
         self._show_image(display)
+
+    def _draw_manual_edits_overlay(self, display: np.ndarray):
+        has_walls = self._manual_walls is not None and np.any(self._manual_walls)
+        has_unknown = self._manual_unknown is not None and np.any(self._manual_unknown)
+        has_free = self._manual_free is not None and np.any(self._manual_free)
+        if not has_walls and not has_unknown and not has_free:
+            return
+
+        h, w = self._original.shape
+        wall_mask = self._manual_walls == 1 if has_walls else None
+        unknown_mask = self._manual_unknown == 1 if has_unknown else None
+        free_mask = self._manual_free == 1 if has_free else None
+        panel_span = w + 20
+        panel_count = max(1, (display.shape[1] + 20) // panel_span)
+        overlay_panels = 1 if panel_count == 1 else min(2, panel_count)
+
+        for panel_idx in range(overlay_panels):
+            x0 = panel_idx * panel_span
+            if x0 + w > display.shape[1] or display.shape[0] != h:
+                continue
+            panel = display[:, x0 : x0 + w]
+            if unknown_mask is not None:
+                panel[unknown_mask] = (205, 205, 205)
+            if free_mask is not None:
+                panel[free_mask] = (255, 255, 255)
+            if wall_mask is not None:
+                panel[wall_mask] = (0, 0, 0)
 
     def _show_image(self, rgb: np.ndarray):
         cw = self._canvas.winfo_width()
@@ -495,8 +766,12 @@ class MapCleanerApp(ctk.CTk):
         mx = int(ix / r["scale"])
         my = int(iy / r["scale"])
         orig_w = self._original.shape[1]
-        if mx >= orig_w:
-            mx = mx - orig_w - 20
+        if r["orig_w"] > orig_w:
+            panel_span = orig_w + 20
+            panel_x = mx % panel_span
+            if panel_x >= orig_w:
+                return None, None
+            mx = panel_x
         mx = max(0, min(mx, orig_w - 1))
         my = max(0, min(my, self._original.shape[0] - 1))
         return mx, my
@@ -508,8 +783,40 @@ class MapCleanerApp(ctk.CTk):
 
     def _on_canvas_click(self, event):
         mx, my = self._canvas_to_map(event.x, event.y)
-        if mx is not None:
+        if mx is None:
+            return
+
+        mode = self._canvas_mode_var.get()
+        if mode == "Points":
             self._add_point(mx, my)
+            return
+
+        if mode == "Gray":
+            self._paint_manual_unknown(mx, my)
+        elif mode == "White":
+            self._paint_manual_free(mx, my)
+        else:
+            self._paint_manual_wall(mx, my, erase=(mode == "Unpaint"))
+
+    def _on_canvas_drag(self, event):
+        mode = self._canvas_mode_var.get()
+        if mode == "Points":
+            return
+
+        mx, my = self._canvas_to_map(event.x, event.y)
+        if mx is None:
+            self._last_paint_xy = None
+            return
+
+        if mode == "Gray":
+            self._paint_manual_unknown(mx, my)
+        elif mode == "White":
+            self._paint_manual_free(mx, my)
+        else:
+            self._paint_manual_wall(mx, my, erase=(mode == "Unpaint"))
+
+    def _on_canvas_release(self, event):
+        self._last_paint_xy = None
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────

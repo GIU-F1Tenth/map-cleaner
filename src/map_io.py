@@ -53,8 +53,9 @@ def build_comparison_image(
     original: np.ndarray, cleaned: np.ndarray, track_mask: np.ndarray
 ) -> np.ndarray:
     """
-    Build a side-by-side BGR comparison: Original | Cleaned.
-    The track interior is tinted green on the cleaned side.
+    Build a side-by-side BGR comparison: Original | SAM Mask | Cleaned.
+    Free cells are tinted green on the cleaned side while occupied and unknown
+    cells stay visible.
     """
     # ensure both are grayscale before converting to BGR
     if original.ndim == 3:
@@ -64,20 +65,26 @@ def build_comparison_image(
 
     orig_bgr = cv2.cvtColor(original, cv2.COLOR_GRAY2BGR)
     cleaned_bgr = cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR)
+    mask_bgr = np.full_like(orig_bgr, 205)
 
+    cleaned_bgr[cleaned == 255] = (180, 230, 180)
     if track_mask is not None:
-        # resize mask to match image if needed
         if track_mask.shape != original.shape:
             track_mask = cv2.resize(
                 track_mask,
                 (original.shape[1], original.shape[0]),
                 interpolation=cv2.INTER_NEAREST,
             )
-        cleaned_bgr[track_mask == 1] = (180, 230, 180)
+        track_mask = (track_mask > 0).astype(np.uint8)
+        mask_bgr[track_mask == 1] = (255, 255, 255)
+        contours, _ = cv2.findContours(
+            track_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(mask_bgr, contours, -1, (0, 0, 0), 1)
 
     h, w = original.shape
     gap = np.full((h, 20, 3), 160, dtype=np.uint8)
-    panel = np.hstack([orig_bgr, gap, cleaned_bgr])
+    panel = np.hstack([orig_bgr, gap, mask_bgr, gap, cleaned_bgr])
 
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = max(0.5, w / 800)
@@ -85,6 +92,21 @@ def build_comparison_image(
     pad = int(10 * scale)
     cv2.putText(panel, "Original", (pad, pad + 20), font, scale, (0, 80, 220), thick)
     cv2.putText(
-        panel, "Cleaned", (w + 20 + pad, pad + 20), font, scale, (0, 160, 60), thick
+        panel,
+        "SAM Mask",
+        (w + 20 + pad, pad + 20),
+        font,
+        scale,
+        (220, 80, 0),
+        thick,
+    )
+    cv2.putText(
+        panel,
+        "Cleaned",
+        (2 * (w + 20) + pad, pad + 20),
+        font,
+        scale,
+        (0, 160, 60),
+        thick,
     )
     return panel
