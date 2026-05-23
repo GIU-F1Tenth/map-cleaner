@@ -96,14 +96,7 @@ def derive_occupancy_grid_and_mask(
         largest = 1 + int(np.argmax(stats2[1:, cv2.CC_STAT_AREA]))
         cleaned_mask = (labels2 == largest).astype(np.uint8)
 
-    # smooth the boundary
-    blurred = cv2.GaussianBlur(
-        cleaned_mask.astype(np.float32),
-        (0, 0),
-        sigmaX=smooth_sigma,
-        sigmaY=smooth_sigma,
-    )
-    smooth_mask = (blurred > 0.5).astype(np.uint8)
+    smooth_mask = cleaned_mask.copy()
 
     cleanup_barrier = _temporary_cleanup_barrier(
         source_gray, smooth_mask, wall_thickness, min_hole_area, manual_wall_mask
@@ -127,10 +120,9 @@ def derive_occupancy_grid_and_mask(
     final_free = _keep_seeded_or_largest_component(final_free, seed_points)
 
     # wall boundary ring
+    wall = _wall_from_free_mask(final_free, wall_thickness, smooth_sigma)
     k_size = wall_thickness * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-    dilated = cv2.dilate(final_free, kernel, iterations=1)
-    wall = ((dilated == 1) & (final_free == 0)).astype(np.uint8)
     preserved_clearance = cv2.dilate(preserved_structures, kernel, iterations=1)
     wall[(preserved_clearance == 1) & (preserved_structures == 0)] = 0
     wall[helper_clearance == 1] = 0
@@ -214,6 +206,54 @@ def _keep_seeded_or_largest_component(
     keep = np.zeros_like(mask, dtype=np.uint8)
     keep[labels == selected_label] = 1
     return keep
+
+
+def _wall_from_free_mask(
+    free_mask: np.ndarray,
+    wall_thickness: int,
+    smooth_sigma: float,
+) -> np.ndarray:
+    free_mask = (free_mask == 1).astype(np.uint8)
+    if np.count_nonzero(free_mask) == 0:
+        return np.zeros_like(free_mask, dtype=np.uint8)
+
+    k_size = wall_thickness * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+    if smooth_sigma < 0.75:
+        dilated = cv2.dilate(free_mask, kernel, iterations=1)
+        return ((dilated == 1) & (free_mask == 0)).astype(np.uint8)
+
+    contours, hierarchy = cv2.findContours(
+        free_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE
+    )
+    if hierarchy is None or not contours:
+        dilated = cv2.dilate(free_mask, kernel, iterations=1)
+        return ((dilated == 1) & (free_mask == 0)).astype(np.uint8)
+
+    window = max(3, int(round(smooth_sigma * 2)) * 2 + 1)
+    window = min(window, 31)
+    wall = np.zeros_like(free_mask, dtype=np.uint8)
+    thickness = max(1, wall_thickness * 2 + 1)
+    for contour in contours:
+        smoothed = _smooth_contour_points(contour, window)
+        cv2.drawContours(wall, [smoothed], -1, 1, thickness=thickness)
+
+    wall[free_mask == 1] = 0
+    return wall.astype(np.uint8)
+
+
+def _smooth_contour_points(contour: np.ndarray, window: int) -> np.ndarray:
+    points = contour[:, 0, :].astype(np.float32)
+    if len(points) < max(8, window * 2):
+        return contour
+
+    half = window // 2
+    extended = np.vstack([points[-half:], points, points[:half]])
+    kernel = np.ones(window, dtype=np.float32) / window
+    xs = np.convolve(extended[:, 0], kernel, mode="valid")
+    ys = np.convolve(extended[:, 1], kernel, mode="valid")
+    smoothed = np.column_stack([xs, ys])
+    return np.round(smoothed).astype(np.int32).reshape(-1, 1, 2)
 
 
 def _helper_fill_zone(
@@ -323,7 +363,7 @@ def _final_preserved_structures(
         if deep_count == 0:
             continue
         if np.any(component & (exterior_band == 1)):
-            min_deep_count = max(10, int(stats[label, cv2.CC_STAT_AREA] * 0.25))
+            min_deep_count = max(10, int(stats[label, cv2.CC_STAT_AREA] * 0.75))
             if deep_count < min_deep_count:
                 continue
         keep[component] = 1

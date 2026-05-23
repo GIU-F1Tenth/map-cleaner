@@ -61,6 +61,9 @@ class MapCleanerApp(ctk.CTk):
         self._manual_unknown = None
         self._manual_free = None
         self._output_white = None
+        self._output_black = None
+        self._output_black_base = None
+        self._output_black_white_base = None
         self._last_paint_xy = None
         self._zoom = 1.0
         self._pan_x = 0.0
@@ -69,6 +72,7 @@ class MapCleanerApp(ctk.CTk):
         self._brush_cursor_ids = []
         self._last_cursor_xy = None
         self._preview_mode_var = None
+        self._show_comparison = SHOW_COMPARISON_PREVIEW
 
         self._build_ui()
 
@@ -225,7 +229,7 @@ class MapCleanerApp(ctk.CTk):
         self._wall_label.pack(side="left", padx=(8, 0))
 
         # smoothing
-        ctk.CTkLabel(left, text="Boundary smoothing (sigma)", font=FONT).pack(
+        ctk.CTkLabel(left, text="Wall smoothing (sigma)", font=FONT).pack(
             anchor="w", padx=16, pady=(10, 2)
         )
         self._sigma_var = ctk.DoubleVar(value=3.0)
@@ -315,14 +319,15 @@ class MapCleanerApp(ctk.CTk):
         self._preview_mode_var = ctk.StringVar(
             value="3 images" if SHOW_COMPARISON_PREVIEW else "Result only"
         )
-        ctk.CTkSegmentedButton(
+        self._preview_mode_selector = ctk.CTkSegmentedButton(
             top_row,
             values=["Result only", "3 images"],
             variable=self._preview_mode_var,
             command=self._on_preview_mode_change,
             font=FONT_SMALL,
             width=160,
-        ).pack(side="left", padx=(12, 2))
+        )
+        self._preview_mode_selector.pack(side="left", padx=(12, 2))
         ctk.CTkButton(
             top_row,
             text="-",
@@ -515,27 +520,81 @@ class MapCleanerApp(ctk.CTk):
         if update_last:
             self._last_paint_xy = point
 
+    def _output_stroke_mask(self, mx: int, my: int, start_point=None):
+        if self._cleaned is None:
+            return None
+
+        stroke = np.zeros_like(self._cleaned, dtype=np.uint8)
+        self._paint_mask(
+            stroke,
+            mx,
+            my,
+            value=1,
+            update_last=False,
+            start_point=start_point,
+        )
+        return stroke == 1
+
     def _paint_output(self, mx: int, my: int, value: int, white: bool = False):
         if self._cleaned is None:
             return
 
         start = self._last_paint_xy
-        self._paint_mask(self._cleaned, mx, my, value=value, start_point=start)
+        stroke_mask = self._output_stroke_mask(mx, my, start)
+        if stroke_mask is None:
+            return
+
+        if value == OCCUPIED and self._output_black is not None:
+            first_black = stroke_mask & (self._output_black == 0)
+            if self._output_black_base is not None:
+                self._output_black_base[first_black] = self._cleaned[first_black]
+            if (
+                self._output_black_white_base is not None
+                and self._output_white is not None
+            ):
+                self._output_black_white_base[first_black] = self._output_white[
+                    first_black
+                ]
+            self._output_black[stroke_mask] = 1
+        elif self._output_black is not None:
+            self._output_black[stroke_mask] = 0
+
+        self._cleaned[stroke_mask] = value
         if self._output_white is not None:
-            self._paint_mask(
-                self._output_white,
-                mx,
-                my,
-                value=1 if white else 0,
-                update_last=False,
-                start_point=start,
-            )
+            self._output_white[stroke_mask] = 1 if white else 0
+        self._last_paint_xy = (int(mx), int(my))
+        self._refresh_cleaned_preview()
+
+    def _erase_output_black(self, mx: int, my: int):
+        if (
+            self._cleaned is None
+            or self._output_black is None
+            or self._output_black_base is None
+        ):
+            return
+
+        start = self._last_paint_xy
+        stroke_mask = self._output_stroke_mask(mx, my, start)
+        if stroke_mask is None:
+            return
+
+        erase_mask = stroke_mask & (self._output_black == 1)
+        if np.any(erase_mask):
+            self._cleaned[erase_mask] = self._output_black_base[erase_mask]
+            self._output_black[erase_mask] = 0
+            if (
+                self._output_white is not None
+                and self._output_black_white_base is not None
+            ):
+                self._output_white[erase_mask] = self._output_black_white_base[
+                    erase_mask
+                ]
+
+        self._last_paint_xy = (int(mx), int(my))
         self._refresh_cleaned_preview()
 
     def _show_comparison_preview(self):
-        if self._preview_mode_var is None:
-            return SHOW_COMPARISON_PREVIEW
-        return self._preview_mode_var.get() == "3 images"
+        return self._show_comparison
 
     def _build_current_preview_image(self):
         comparison = build_comparison_image(
@@ -575,6 +634,9 @@ class MapCleanerApp(ctk.CTk):
     def _mark_manual_edits_changed(self):
         self._cleaned = None
         self._output_white = None
+        self._output_black = None
+        self._output_black_base = None
+        self._output_black_white_base = None
         self._save_btn.configure(state="disabled")
         self._stats_label.configure(text="")
         self._status.configure(
@@ -655,7 +717,13 @@ class MapCleanerApp(ctk.CTk):
         self._brush_label.configure(text=str(int(float(val))))
         self._redraw_brush_cursor()
 
-    def _on_preview_mode_change(self, _mode=None):
+    def _on_preview_mode_change(self, mode=None):
+        if mode is None and self._preview_mode_var is not None:
+            mode = self._preview_mode_var.get()
+        self._show_comparison = mode == "3 images"
+        if self._preview_mode_var is not None:
+            selected_mode = "3 images" if self._show_comparison else "Result only"
+            self._preview_mode_var.set(selected_mode)
         self._last_paint_xy = None
         self._last_cursor_xy = None
         self._hide_brush_cursor()
@@ -714,6 +782,9 @@ class MapCleanerApp(ctk.CTk):
         self._manual_unknown = np.zeros_like(self._original, dtype=np.uint8)
         self._manual_free = np.zeros_like(self._original, dtype=np.uint8)
         self._output_white = None
+        self._output_black = None
+        self._output_black_base = None
+        self._output_black_white_base = None
         self._last_paint_xy = None
         self._zoom = 1.0
         self._pan_x = 0.0
@@ -772,6 +843,9 @@ class MapCleanerApp(ctk.CTk):
         self._track_mask = mask
         self._cleaned = cleaned
         self._output_white = np.zeros_like(cleaned, dtype=np.uint8)
+        self._output_black = np.zeros_like(cleaned, dtype=np.uint8)
+        self._output_black_base = cleaned.copy()
+        self._output_black_white_base = np.zeros_like(cleaned, dtype=np.uint8)
         self._zoom = 1.0
         self._pan_x = 0.0
         self._pan_y = 0.0
@@ -802,22 +876,23 @@ class MapCleanerApp(ctk.CTk):
         stem = self._yaml_path.stem
         path = filedialog.asksaveasfilename(
             initialdir=str(OUTPUT_DIR),
-            initialfile=f"{stem}_sam_cleaned.pgm",
-            filetypes=[("PGM files", "*.pgm")],
+            initialfile=f"{stem}_sam_cleaned.png",
+            defaultextension=".png",
+            filetypes=[("PNG files", "*.png")],
         )
         if not path:
             return
-        out_pgm = Path(path)
-        out_yaml = out_pgm.with_suffix(".yaml")
-        out_png = out_pgm.with_name(out_pgm.stem + "_preview.png")
-        save_map(self._cleaned, self._meta, out_pgm, out_yaml)
+        out_image = Path(path)
+        out_yaml = out_image.with_suffix(".yaml")
+        out_preview = out_image.with_name(out_image.stem + "_preview.png")
+        save_map(self._cleaned, self._meta, out_image, out_yaml)
         comparison = self._build_current_preview_image()
-        cv2.imwrite(str(out_png), comparison)
-        self._status.configure(text=f"Saved to {out_pgm.parent}")
+        cv2.imwrite(str(out_preview), comparison)
+        self._status.configure(text=f"Saved to {out_image.parent}")
         from tkinter import messagebox
 
         messagebox.showinfo(
-            "Saved", f"Saved:\n  {out_pgm.name}\n  {out_yaml.name}\n  {out_png.name}"
+            "Saved", f"Saved:\n  {out_image.name}\n  {out_yaml.name}\n  {out_preview.name}"
         )
 
     # ── preview ───────────────────────────────────────────────────────────────
@@ -958,6 +1033,8 @@ class MapCleanerApp(ctk.CTk):
             return
         if panel_idx != 0 and not self._is_cleaned_panel(panel_idx):
             return
+        if self._is_cleaned_panel(panel_idx) and not self._can_edit_cleaned_panel(mode):
+            return
 
         brush_px = max(1, int(self._brush_var.get())) * self._render_info["scale"]
         radius = max(2.0, brush_px / 2)
@@ -1081,10 +1158,13 @@ class MapCleanerApp(ctk.CTk):
             return True
         return panel_idx == 2
 
+    def _can_edit_cleaned_panel(self, mode):
+        return mode == "Erase line" or self._output_value_for_mode(mode) is not None
+
     def _output_value_for_mode(self, mode):
         if mode == "Black":
             return OCCUPIED
-        if mode in ("Erase line", "Gray"):
+        if mode == "Gray":
             return UNKNOWN
         if mode in ("Green", "White"):
             return FREE
@@ -1104,6 +1184,9 @@ class MapCleanerApp(ctk.CTk):
 
         mode = self._canvas_mode_var.get()
         if self._is_cleaned_panel(panel_idx):
+            if mode == "Erase line":
+                self._erase_output_black(mx, my)
+                return
             value = self._output_value_for_mode(mode)
             if value is not None:
                 self._paint_output(mx, my, value, white=(mode == "White"))
@@ -1133,6 +1216,9 @@ class MapCleanerApp(ctk.CTk):
             return
 
         if self._is_cleaned_panel(panel_idx):
+            if mode == "Erase line":
+                self._erase_output_black(mx, my)
+                return
             value = self._output_value_for_mode(mode)
             if value is not None:
                 self._paint_output(mx, my, value, white=(mode == "White"))

@@ -1,6 +1,6 @@
 """
 map_io.py
-Handles loading and saving files (.pgm + .yaml).
+Handles loading and saving map image files plus .yaml metadata.
 """
 
 from pathlib import Path
@@ -27,15 +27,15 @@ def load_map(yaml_path: str | Path) -> tuple[np.ndarray, dict]:
     return img, meta
 
 
-def save_map(cleaned: np.ndarray, meta: dict, out_pgm: Path, out_yaml: Path) -> None:
+def save_map(cleaned: np.ndarray, meta: dict, out_image: Path, out_yaml: Path) -> None:
     """
-    Save a cleaned occupancy grid as .pgm + .yaml.
+    Save a cleaned occupancy grid image plus .yaml.
     The .yaml is a copy of the original metadata with the image filename updated.
     """
-    cv2.imwrite(str(out_pgm), cleaned)
+    cv2.imwrite(str(out_image), cleaned)
 
     new_meta = dict(meta)
-    new_meta["image"] = out_pgm.name
+    new_meta["image"] = out_image.name
     with open(out_yaml, "w") as f:
         yaml.dump(new_meta, f, default_flow_style=False)
 
