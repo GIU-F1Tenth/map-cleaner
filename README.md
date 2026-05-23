@@ -9,8 +9,6 @@ A small tool for cleaning occupancy grid maps with MobileSAM. It loads a map ima
 - Internet access on first setup
 - A map YAML file whose `image` field points to the map image file
 
-The first segmentation run downloads `mobile_sam.pt` into `src/models/`.
-
 ## Installation
 
 Clone the repository:
@@ -38,6 +36,20 @@ Install dependencies:
 
 ```powershell
 python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+`requirements.txt` lists the direct runtime dependencies. Pip resolves the
+extra packages they need automatically.
+
+The MobileSAM Python package is installed by `requirements.txt`, but the
+checkpoint file is not stored in the repository. The first segmentation run
+downloads `mobile_sam.pt` into `src/models/`.
+
+PyTorch installation can vary by platform and GPU/CUDA setup. If you need a
+specific CUDA build, install the matching PyTorch packages first, then run:
+
+```powershell
 python -m pip install -r requirements.txt
 ```
 
@@ -203,16 +215,6 @@ You can also use the mouse wheel to zoom. Right-drag or middle-drag pans the pre
 ### Status And Statistics
 
 After processing, the status area shows the percentage of the output map that is free, occupied, and unknown. It also reports current actions such as missing prompt points, completed runs, preview mode changes, or saved files.
-
-## Dependency Notes
-
-`requirements.txt` lists direct runtime dependencies only. Pip resolves transitive packages automatically.
-
-PyTorch installation can vary by platform and GPU/CUDA setup. If you need a specific CUDA build, install the matching PyTorch packages first, then run:
-
-```powershell
-python -m pip install -r requirements.txt
-```
 
 ## Troubleshooting
 
