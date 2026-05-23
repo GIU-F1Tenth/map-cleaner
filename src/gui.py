@@ -60,6 +60,7 @@ class MapCleanerApp(ctk.CTk):
         self._manual_walls = None
         self._manual_unknown = None
         self._manual_free = None
+        self._output_white = None
         self._last_paint_xy = None
         self._zoom = 1.0
         self._pan_x = 0.0
@@ -138,14 +139,22 @@ class MapCleanerApp(ctk.CTk):
             anchor="w", padx=16, pady=(10, 4)
         )
         self._canvas_mode_var = ctk.StringVar(value="Points")
-        self._canvas_mode = ctk.CTkSegmentedButton(
+        self._canvas_mode_top = ctk.CTkSegmentedButton(
             left,
-            values=["Points", "Black", "Erase line", "Gray", "White"],
+            values=["Points", "Black", "Erase line"],
             variable=self._canvas_mode_var,
             command=self._on_canvas_mode_change,
             font=FONT_SMALL,
         )
-        self._canvas_mode.pack(fill="x", padx=16, pady=(0, 10))
+        self._canvas_mode_top.pack(fill="x", padx=16, pady=(0, 4))
+        self._canvas_mode_bottom = ctk.CTkSegmentedButton(
+            left,
+            values=["Gray", "Green", "White"],
+            variable=self._canvas_mode_var,
+            command=self._on_canvas_mode_change,
+            font=FONT_SMALL,
+        )
+        self._canvas_mode_bottom.pack(fill="x", padx=16, pady=(0, 10))
 
         ctk.CTkLabel(left, text="Brush size (px)", font=FONT).pack(
             anchor="w", padx=16, pady=(0, 2)
@@ -187,7 +196,7 @@ class MapCleanerApp(ctk.CTk):
 
         ctk.CTkButton(
             left,
-            text="Clear white edits",
+            text="Clear green/white edits",
             font=FONT_SMALL,
             fg_color="#616161",
             hover_color="#424242",
@@ -506,12 +515,21 @@ class MapCleanerApp(ctk.CTk):
         if update_last:
             self._last_paint_xy = point
 
-    def _paint_output(self, mx: int, my: int, value: int):
+    def _paint_output(self, mx: int, my: int, value: int, white: bool = False):
         if self._cleaned is None:
             return
 
         start = self._last_paint_xy
         self._paint_mask(self._cleaned, mx, my, value=value, start_point=start)
+        if self._output_white is not None:
+            self._paint_mask(
+                self._output_white,
+                mx,
+                my,
+                value=1 if white else 0,
+                update_last=False,
+                start_point=start,
+            )
         self._refresh_cleaned_preview()
 
     def _show_comparison_preview(self):
@@ -519,16 +537,31 @@ class MapCleanerApp(ctk.CTk):
             return SHOW_COMPARISON_PREVIEW
         return self._preview_mode_var.get() == "3 images"
 
-    def _refresh_cleaned_preview(self, status_text="Output edited - review then save."):
-        if self._cleaned is None:
-            return
-
+    def _build_current_preview_image(self):
         comparison = build_comparison_image(
             self._original,
             self._cleaned,
             self._track_mask,
             self._show_comparison_preview(),
         )
+        if self._output_white is None or not np.any(self._output_white):
+            return comparison
+
+        h, w = self._original.shape
+        white_mask = self._output_white == 1
+        if self._show_comparison_preview():
+            x0 = (w + 20) * 2
+            cleaned_panel = comparison[:, x0 : x0 + w]
+            cleaned_panel[white_mask] = (255, 255, 255)
+        else:
+            comparison[white_mask] = (255, 255, 255)
+        return comparison
+
+    def _refresh_cleaned_preview(self, status_text="Output edited - review then save."):
+        if self._cleaned is None:
+            return
+
+        comparison = self._build_current_preview_image()
         self._current_rgb = cv2.cvtColor(comparison, cv2.COLOR_BGR2RGB)
         self._save_btn.configure(state="normal")
         stats = grid_stats(self._cleaned)
@@ -541,6 +574,7 @@ class MapCleanerApp(ctk.CTk):
 
     def _mark_manual_edits_changed(self):
         self._cleaned = None
+        self._output_white = None
         self._save_btn.configure(state="disabled")
         self._stats_label.configure(text="")
         self._status.configure(
@@ -650,10 +684,12 @@ class MapCleanerApp(ctk.CTk):
             )
         elif mode == "Gray":
             self._status.configure(text="Drag on the preview to gray out map pixels.")
-        else:
+        elif mode == "Green":
             self._status.configure(
-                text="Drag to paint free space; on cleaned output it shows as green."
+                text="Drag to paint the track interior/free-space color."
             )
+        else:
+            self._status.configure(text="Drag to paint true white free-space cells.")
 
     def _browse_file(self):
         from tkinter import filedialog
@@ -677,6 +713,7 @@ class MapCleanerApp(ctk.CTk):
         self._manual_walls = np.zeros_like(self._original, dtype=np.uint8)
         self._manual_unknown = np.zeros_like(self._original, dtype=np.uint8)
         self._manual_free = np.zeros_like(self._original, dtype=np.uint8)
+        self._output_white = None
         self._last_paint_xy = None
         self._zoom = 1.0
         self._pan_x = 0.0
@@ -734,13 +771,12 @@ class MapCleanerApp(ctk.CTk):
     def _on_done(self, mask, cleaned):
         self._track_mask = mask
         self._cleaned = cleaned
+        self._output_white = np.zeros_like(cleaned, dtype=np.uint8)
         self._zoom = 1.0
         self._pan_x = 0.0
         self._pan_y = 0.0
         self._pan_start = None
-        comparison = build_comparison_image(
-            self._original, cleaned, mask, self._show_comparison_preview()
-        )
+        comparison = self._build_current_preview_image()
         self._current_rgb = cv2.cvtColor(comparison, cv2.COLOR_BGR2RGB)
         self._render_to_canvas()
         self._run_btn.configure(state="normal", text="▶  Run")
@@ -775,12 +811,7 @@ class MapCleanerApp(ctk.CTk):
         out_yaml = out_pgm.with_suffix(".yaml")
         out_png = out_pgm.with_name(out_pgm.stem + "_preview.png")
         save_map(self._cleaned, self._meta, out_pgm, out_yaml)
-        comparison = build_comparison_image(
-            self._original,
-            self._cleaned,
-            self._track_mask,
-            self._show_comparison_preview(),
-        )
+        comparison = self._build_current_preview_image()
         cv2.imwrite(str(out_png), comparison)
         self._status.configure(text=f"Saved to {out_pgm.parent}")
         from tkinter import messagebox
@@ -1055,7 +1086,7 @@ class MapCleanerApp(ctk.CTk):
             return OCCUPIED
         if mode in ("Erase line", "Gray"):
             return UNKNOWN
-        if mode == "White":
+        if mode in ("Green", "White"):
             return FREE
         return None
 
@@ -1075,7 +1106,7 @@ class MapCleanerApp(ctk.CTk):
         if self._is_cleaned_panel(panel_idx):
             value = self._output_value_for_mode(mode)
             if value is not None:
-                self._paint_output(mx, my, value)
+                self._paint_output(mx, my, value, white=(mode == "White"))
             return
 
         if panel_idx != 0:
@@ -1087,7 +1118,7 @@ class MapCleanerApp(ctk.CTk):
 
         if mode == "Gray":
             self._paint_manual_unknown(mx, my)
-        elif mode == "White":
+        elif mode in ("Green", "White"):
             self._paint_manual_free(mx, my)
         else:
             self._paint_manual_wall(mx, my, erase=(mode == "Erase line"))
@@ -1104,7 +1135,7 @@ class MapCleanerApp(ctk.CTk):
         if self._is_cleaned_panel(panel_idx):
             value = self._output_value_for_mode(mode)
             if value is not None:
-                self._paint_output(mx, my, value)
+                self._paint_output(mx, my, value, white=(mode == "White"))
             return
 
         if mode == "Points" or panel_idx != 0:
@@ -1112,7 +1143,7 @@ class MapCleanerApp(ctk.CTk):
 
         if mode == "Gray":
             self._paint_manual_unknown(mx, my)
-        elif mode == "White":
+        elif mode in ("Green", "White"):
             self._paint_manual_free(mx, my)
         else:
             self._paint_manual_wall(mx, my, erase=(mode == "Erase line"))
