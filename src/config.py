@@ -16,6 +16,10 @@ OUTPUT_DIR: Path = (ROOT / "maps").resolve()
 SAM_WEIGHTS_URL = (
     "https://github.com/ChaoningZhang/MobileSAM/raw/master/weights/mobile_sam.pt"
 )
+
+# Startup default. True: show Original | SAM Mask | Cleaned. False: show only cleaned.
+SHOW_COMPARISON_PREVIEW: bool = False
+
 # Create directories if they don't exist yet
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 MAPS_DIR.mkdir(parents=True, exist_ok=True)

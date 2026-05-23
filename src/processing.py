@@ -62,13 +62,15 @@ def derive_occupancy_grid_and_mask(
     manual_wall_mask = _as_mask(manual_walls, original_gray.shape)
     manual_unknown_mask = _as_mask(manual_unknown, original_gray.shape)
     manual_free_mask = _as_mask(manual_free, original_gray.shape)
-    manual_helper_mask = (
+    manual_wall_output_mask = (
         (manual_wall_mask == 1)
         & (manual_unknown_mask == 0)
         & (manual_free_mask == 0)
-        & (original_gray > 64)
     ).astype(np.uint8)
-    manual_remove_mask = ((manual_helper_mask == 1) | (manual_free_mask == 1)).astype(
+    helper_clearance = _helper_output_clearance(
+        manual_wall_output_mask, wall_thickness
+    )
+    manual_remove_mask = ((helper_clearance == 1) | (manual_free_mask == 1)).astype(
         np.uint8
     )
     source_gray = original_gray.copy()
@@ -120,8 +122,7 @@ def derive_occupancy_grid_and_mask(
     final_free = ((inside_mask == 1) & (preserved_structures == 0)).astype(np.uint8)
     final_free[manual_free_mask == 1] = 1
     final_free = _keep_seeded_or_largest_component(final_free, seed_points)
-    helper_clearance = _helper_output_clearance(manual_helper_mask, wall_thickness)
-    helper_fill_zone = _helper_fill_zone(helper_clearance, final_free, inside_mask)
+    helper_fill_zone = _helper_fill_zone(helper_clearance, final_free, smooth_mask)
     final_free[helper_fill_zone == 1] = 1
     final_free = _keep_seeded_or_largest_component(final_free, seed_points)
 
@@ -132,8 +133,7 @@ def derive_occupancy_grid_and_mask(
     wall = ((dilated == 1) & (final_free == 0)).astype(np.uint8)
     preserved_clearance = cv2.dilate(preserved_structures, kernel, iterations=1)
     wall[(preserved_clearance == 1) & (preserved_structures == 0)] = 0
-    wider_helper_clearance = helper_clearance
-    wall[wider_helper_clearance == 1] = 0
+    wall[helper_clearance == 1] = 0
     preserved_structures[helper_clearance == 1] = 0
 
     # build grid
@@ -142,8 +142,8 @@ def derive_occupancy_grid_and_mask(
     out[final_free == 1] = FREE
     out[wall == 1] = OCCUPIED
     out[(preserved_structures == 1) & (original_gray <= 64)] = OCCUPIED
-    out[wider_helper_clearance == 1] = UNKNOWN
-    out[(final_free == 1) & (wider_helper_clearance == 1)] = FREE
+    out[helper_clearance == 1] = UNKNOWN
+    out[helper_fill_zone == 1] = FREE
     out[manual_unknown_mask == 1] = UNKNOWN
     out[(manual_free_mask == 1) & (final_free == 1)] = FREE
 
@@ -219,7 +219,7 @@ def _keep_seeded_or_largest_component(
 def _helper_fill_zone(
     helper_clearance: np.ndarray,
     final_free: np.ndarray,
-    inside_mask: np.ndarray,
+    candidate_mask: np.ndarray,
 ) -> np.ndarray:
     num_labels, labels, _, _ = cv2.connectedComponentsWithStats(
         helper_clearance, connectivity=8
@@ -233,7 +233,7 @@ def _helper_fill_zone(
     for label in range(1, num_labels):
         component = (labels == label).astype(np.uint8)
         if np.any((component == 1) & nearby_free):
-            keep[(component == 1) & (inside_mask == 1)] = 1
+            keep[(component == 1) & (candidate_mask == 1)] = 1
 
     return keep
 
@@ -242,7 +242,7 @@ def _helper_output_clearance(helper_mask: np.ndarray, wall_thickness: int) -> np
     if np.count_nonzero(helper_mask) == 0:
         return helper_mask.copy()
 
-    radius = max(8, min(28, wall_thickness * 6 + 10))
+    radius = max(4, min(16, wall_thickness * 3 + 5))
     size = radius * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
     return cv2.dilate(helper_mask, kernel, iterations=1).astype(np.uint8)
@@ -309,23 +309,37 @@ def _final_preserved_structures(
     )
 
     keep = np.zeros_like(candidate_mask, dtype=np.uint8)
-    exterior = _exterior_touch_mask(candidate_mask, radius=3)
+    interior = candidate_mask == 1
+    deep_interior = _eroded_interior(candidate_mask)
+    exterior_band = _exterior_band(candidate_mask)
 
     for label in range(1, num_labels):
         component = labels == label
-        if np.any(component & (exterior == 1)):
-            continue
         if stats[label, cv2.CC_STAT_AREA] < 1:
             continue
+        if not np.any(component & interior):
+            continue
+        deep_count = int(np.count_nonzero(component & (deep_interior == 1)))
+        if deep_count == 0:
+            continue
+        if np.any(component & (exterior_band == 1)):
+            min_deep_count = max(10, int(stats[label, cv2.CC_STAT_AREA] * 0.25))
+            if deep_count < min_deep_count:
+                continue
         keep[component] = 1
 
     return keep
 
 
-def _exterior_touch_mask(mask: np.ndarray, radius: int) -> np.ndarray:
-    size = radius * 2 + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
-    return cv2.dilate((mask == 0).astype(np.uint8), kernel, iterations=1)
+def _eroded_interior(mask: np.ndarray) -> np.ndarray:
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+    return cv2.erode((mask == 1).astype(np.uint8), kernel, iterations=1)
+
+
+def _exterior_band(mask: np.ndarray) -> np.ndarray:
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    outside = _outside_reachable_from_edges((mask == 1).astype(np.uint8))
+    return cv2.dilate(outside, kernel, iterations=1)
 
 
 def _outside_reachable_from_edges(cleanup_barrier: np.ndarray) -> np.ndarray:

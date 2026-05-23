@@ -50,7 +50,10 @@ def pgm_to_rgb(pgm: np.ndarray) -> np.ndarray:
 
 
 def build_comparison_image(
-    original: np.ndarray, cleaned: np.ndarray, track_mask: np.ndarray
+    original: np.ndarray,
+    cleaned: np.ndarray,
+    track_mask: np.ndarray,
+    show_comparison: bool = True,
 ) -> np.ndarray:
     """
     Build a side-by-side BGR comparison: Original | SAM Mask | Cleaned.
@@ -68,6 +71,24 @@ def build_comparison_image(
     mask_bgr = np.full_like(orig_bgr, 205)
 
     cleaned_bgr[cleaned == 255] = (180, 230, 180)
+    h, w = original.shape
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.5, w / 800)
+    thick = max(1, int(scale * 2))
+    pad = int(10 * scale)
+
+    if not show_comparison:
+        cv2.putText(
+            cleaned_bgr,
+            "Cleaned",
+            (pad, pad + 20),
+            font,
+            scale,
+            (0, 160, 60),
+            thick,
+        )
+        return cleaned_bgr
+
     if track_mask is not None:
         if track_mask.shape != original.shape:
             track_mask = cv2.resize(
@@ -82,14 +103,9 @@ def build_comparison_image(
         )
         cv2.drawContours(mask_bgr, contours, -1, (0, 0, 0), 1)
 
-    h, w = original.shape
     gap = np.full((h, 20, 3), 160, dtype=np.uint8)
     panel = np.hstack([orig_bgr, gap, mask_bgr, gap, cleaned_bgr])
 
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = max(0.5, w / 800)
-    thick = max(1, int(scale * 2))
-    pad = int(10 * scale)
     cv2.putText(panel, "Original", (pad, pad + 20), font, scale, (0, 80, 220), thick)
     cv2.putText(
         panel,

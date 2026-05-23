@@ -11,9 +11,15 @@ import customtkinter as ctk
 import numpy as np
 from PIL import Image, ImageTk
 
-from config import MAPS_DIR, OUTPUT_DIR
+from config import MAPS_DIR, OUTPUT_DIR, SHOW_COMPARISON_PREVIEW
 from map_io import build_comparison_image, load_map, pgm_to_rgb, save_map
-from processing import derive_occupancy_grid_and_mask, grid_stats
+from processing import (
+    FREE,
+    OCCUPIED,
+    UNKNOWN,
+    derive_occupancy_grid_and_mask,
+    grid_stats,
+)
 from sam_model import init_sam, resize_mask_to, segment_points
 
 ctk.set_appearance_mode("light")
@@ -55,6 +61,13 @@ class MapCleanerApp(ctk.CTk):
         self._manual_unknown = None
         self._manual_free = None
         self._last_paint_xy = None
+        self._zoom = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._pan_start = None
+        self._brush_cursor_ids = []
+        self._last_cursor_xy = None
+        self._preview_mode_var = None
 
         self._build_ui()
 
@@ -127,7 +140,7 @@ class MapCleanerApp(ctk.CTk):
         self._canvas_mode_var = ctk.StringVar(value="Points")
         self._canvas_mode = ctk.CTkSegmentedButton(
             left,
-            values=["Points", "Paint", "Unpaint", "Gray", "White"],
+            values=["Points", "Black", "Erase line", "Gray", "White"],
             variable=self._canvas_mode_var,
             command=self._on_canvas_mode_change,
             font=FONT_SMALL,
@@ -290,6 +303,45 @@ class MapCleanerApp(ctk.CTk):
         top_row = ctk.CTkFrame(right, fg_color="transparent")
         top_row.grid(row=0, column=0, sticky="ew")
         ctk.CTkLabel(top_row, text="Preview", font=FONT).pack(side="left")
+        self._preview_mode_var = ctk.StringVar(
+            value="3 images" if SHOW_COMPARISON_PREVIEW else "Result only"
+        )
+        ctk.CTkSegmentedButton(
+            top_row,
+            values=["Result only", "3 images"],
+            variable=self._preview_mode_var,
+            command=self._on_preview_mode_change,
+            font=FONT_SMALL,
+            width=160,
+        ).pack(side="left", padx=(12, 2))
+        ctk.CTkButton(
+            top_row,
+            text="-",
+            width=32,
+            height=24,
+            font=FONT_SMALL,
+            command=self._zoom_out,
+        ).pack(side="left", padx=2)
+        ctk.CTkButton(
+            top_row,
+            text="+",
+            width=32,
+            height=24,
+            font=FONT_SMALL,
+            command=self._zoom_in,
+        ).pack(side="left", padx=2)
+        ctk.CTkButton(
+            top_row,
+            text="Fit",
+            width=44,
+            height=24,
+            font=FONT_SMALL,
+            command=self._reset_zoom,
+        ).pack(side="left", padx=2)
+        self._zoom_label = ctk.CTkLabel(
+            top_row, text="100%", font=FONT_SMALL, text_color="gray"
+        )
+        self._zoom_label.pack(side="left", padx=(6, 0))
         self._coord_label = ctk.CTkLabel(
             top_row, text="", font=FONT_SMALL, text_color="gray"
         )
@@ -299,9 +351,19 @@ class MapCleanerApp(ctk.CTk):
         self._canvas.grid(row=1, column=0, sticky="nsew")
         self._canvas.bind("<Configure>", self._on_canvas_resize)
         self._canvas.bind("<Motion>", self._on_mouse_move)
+        self._canvas.bind("<Leave>", self._hide_brush_cursor)
         self._canvas.bind("<Button-1>", self._on_canvas_click)
         self._canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self._canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
+        self._canvas.bind("<MouseWheel>", self._on_mouse_wheel)
+        self._canvas.bind("<Button-4>", self._on_mouse_wheel)
+        self._canvas.bind("<Button-5>", self._on_mouse_wheel)
+        self._canvas.bind("<Button-2>", self._on_pan_start)
+        self._canvas.bind("<B2-Motion>", self._on_pan_drag)
+        self._canvas.bind("<ButtonRelease-2>", self._on_pan_end)
+        self._canvas.bind("<Button-3>", self._on_pan_start)
+        self._canvas.bind("<B3-Motion>", self._on_pan_drag)
+        self._canvas.bind("<ButtonRelease-3>", self._on_pan_end)
 
     # ── points management ─────────────────────────────────────────────────────
 
@@ -444,6 +506,39 @@ class MapCleanerApp(ctk.CTk):
         if update_last:
             self._last_paint_xy = point
 
+    def _paint_output(self, mx: int, my: int, value: int):
+        if self._cleaned is None:
+            return
+
+        start = self._last_paint_xy
+        self._paint_mask(self._cleaned, mx, my, value=value, start_point=start)
+        self._refresh_cleaned_preview()
+
+    def _show_comparison_preview(self):
+        if self._preview_mode_var is None:
+            return SHOW_COMPARISON_PREVIEW
+        return self._preview_mode_var.get() == "3 images"
+
+    def _refresh_cleaned_preview(self, status_text="Output edited - review then save."):
+        if self._cleaned is None:
+            return
+
+        comparison = build_comparison_image(
+            self._original,
+            self._cleaned,
+            self._track_mask,
+            self._show_comparison_preview(),
+        )
+        self._current_rgb = cv2.cvtColor(comparison, cv2.COLOR_BGR2RGB)
+        self._save_btn.configure(state="normal")
+        stats = grid_stats(self._cleaned)
+        self._stats_label.configure(
+            text=f"free {stats['free']}%   occ {stats['occupied']}%   unk {stats['unknown']}%"
+        )
+        if status_text:
+            self._status.configure(text=status_text)
+        self._redraw_preview()
+
     def _mark_manual_edits_changed(self):
         self._cleaned = None
         self._save_btn.configure(state="disabled")
@@ -524,21 +619,41 @@ class MapCleanerApp(ctk.CTk):
 
     def _on_brush_change(self, val):
         self._brush_label.configure(text=str(int(float(val))))
+        self._redraw_brush_cursor()
+
+    def _on_preview_mode_change(self, _mode=None):
+        self._last_paint_xy = None
+        self._last_cursor_xy = None
+        self._hide_brush_cursor()
+        self._zoom = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        if self._cleaned is not None:
+            self._refresh_cleaned_preview(status_text="Preview mode changed.")
+        elif self._current_rgb is not None:
+            self._redraw_preview()
 
     def _on_canvas_mode_change(self, mode):
         self._last_paint_xy = None
+        self._redraw_brush_cursor()
         if self._original is None:
             return
         if mode == "Points":
             self._status.configure(text="Click the preview to add prompt points.")
-        elif mode == "Paint":
-            self._status.configure(text="Drag on the preview to paint wall closures.")
-        elif mode == "Unpaint":
-            self._status.configure(text="Drag on the preview to erase painted walls.")
+        elif mode == "Black":
+            self._status.configure(
+                text="Drag original for helper walls, or cleaned output for black cells."
+            )
+        elif mode == "Erase line":
+            self._status.configure(
+                text="Drag original to erase helper walls, or cleaned output for gray."
+            )
         elif mode == "Gray":
             self._status.configure(text="Drag on the preview to gray out map pixels.")
         else:
-            self._status.configure(text="Drag on the preview to paint free space.")
+            self._status.configure(
+                text="Drag to paint free space; on cleaned output it shows as green."
+            )
 
     def _browse_file(self):
         from tkinter import filedialog
@@ -563,6 +678,10 @@ class MapCleanerApp(ctk.CTk):
         self._manual_unknown = np.zeros_like(self._original, dtype=np.uint8)
         self._manual_free = np.zeros_like(self._original, dtype=np.uint8)
         self._last_paint_xy = None
+        self._zoom = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._pan_start = None
         self._points.clear()
         self._rebuild_points_ui()
         self._current_rgb = cv2.cvtColor(self._original, cv2.COLOR_GRAY2RGB)
@@ -615,7 +734,13 @@ class MapCleanerApp(ctk.CTk):
     def _on_done(self, mask, cleaned):
         self._track_mask = mask
         self._cleaned = cleaned
-        comparison = build_comparison_image(self._original, cleaned, mask)
+        self._zoom = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._pan_start = None
+        comparison = build_comparison_image(
+            self._original, cleaned, mask, self._show_comparison_preview()
+        )
         self._current_rgb = cv2.cvtColor(comparison, cv2.COLOR_BGR2RGB)
         self._render_to_canvas()
         self._run_btn.configure(state="normal", text="▶  Run")
@@ -651,7 +776,10 @@ class MapCleanerApp(ctk.CTk):
         out_png = out_pgm.with_name(out_pgm.stem + "_preview.png")
         save_map(self._cleaned, self._meta, out_pgm, out_yaml)
         comparison = build_comparison_image(
-            self._original, self._cleaned, self._track_mask
+            self._original,
+            self._cleaned,
+            self._track_mask,
+            self._show_comparison_preview(),
         )
         cv2.imwrite(str(out_png), comparison)
         self._status.configure(text=f"Saved to {out_pgm.parent}")
@@ -669,7 +797,10 @@ class MapCleanerApp(ctk.CTk):
             return
         display = self._current_rgb.copy()
         self._draw_manual_edits_overlay(display)
-        if self._render_info and self._points:
+        show_points = self._points and (
+            self._show_comparison_preview() or self._cleaned is None
+        )
+        if self._render_info and show_points:
             scale = self._render_info["scale"]
             orig_w = (
                 self._original.shape[1]
@@ -697,6 +828,9 @@ class MapCleanerApp(ctk.CTk):
         self._show_image(display)
 
     def _draw_manual_edits_overlay(self, display: np.ndarray):
+        if self._cleaned is not None and not self._show_comparison_preview():
+            return
+
         has_walls = self._manual_walls is not None and np.any(self._manual_walls)
         has_unknown = self._manual_unknown is not None and np.any(self._manual_unknown)
         has_free = self._manual_free is not None and np.any(self._manual_free)
@@ -709,7 +843,7 @@ class MapCleanerApp(ctk.CTk):
         free_mask = self._manual_free == 1 if has_free else None
         panel_span = w + 20
         panel_count = max(1, (display.shape[1] + 20) // panel_span)
-        overlay_panels = 1 if panel_count == 1 else min(2, panel_count)
+        overlay_panels = 1
 
         for panel_idx in range(overlay_panels):
             x0 = panel_idx * panel_span
@@ -729,24 +863,37 @@ class MapCleanerApp(ctk.CTk):
         if cw < 10 or ch < 10:
             return
         ih, iw = rgb.shape[:2]
-        scale = min(cw / iw, ch / ih)
-        nw, nh = int(iw * scale), int(ih * scale)
-        resized = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
+        base_scale = min(cw / iw, ch / ih)
+        scale = base_scale * self._zoom
+        nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+        self._clamp_pan(nw, nh, cw, ch)
+        interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_NEAREST
+        resized = cv2.resize(rgb, (nw, nh), interpolation=interpolation)
         pil_img = Image.fromarray(resized)
         self._tk_image = ImageTk.PhotoImage(pil_img)
         self._canvas.delete("all")
+        cx = cw / 2 + self._pan_x
+        cy = ch / 2 + self._pan_y
         self._canvas.create_image(
-            cw // 2, ch // 2, anchor="center", image=self._tk_image
+            int(cx), int(cy), anchor="center", image=self._tk_image
         )
         self._render_info = {
             "scale": scale,
             "nw": nw,
             "nh": nh,
-            "ox": (cw - nw) // 2,
-            "oy": (ch - nh) // 2,
+            "ox": cx - nw / 2,
+            "oy": cy - nh / 2,
             "orig_w": rgb.shape[1],
             "orig_h": rgb.shape[0],
         }
+        self._zoom_label.configure(text=f"{int(round(self._zoom * 100))}%")
+        self._redraw_brush_cursor()
+
+    def _clamp_pan(self, image_w: int, image_h: int, canvas_w: int, canvas_h: int):
+        max_x = max(0, (image_w - canvas_w) / 2)
+        max_y = max(0, (image_h - canvas_h) / 2)
+        self._pan_x = min(max(self._pan_x, -max_x), max_x)
+        self._pan_y = min(max(self._pan_y, -max_y), max_y)
 
     def _render_to_canvas(self):
         if self._current_rgb is not None:
@@ -755,38 +902,185 @@ class MapCleanerApp(ctk.CTk):
     def _on_canvas_resize(self, event):
         self._render_to_canvas()
 
-    def _canvas_to_map(self, cx, cy):
+    def _hide_brush_cursor(self, event=None):
+        for cursor_id in self._brush_cursor_ids:
+            self._canvas.delete(cursor_id)
+        self._brush_cursor_ids = []
+        if event is not None:
+            self._last_cursor_xy = None
+
+    def _redraw_brush_cursor(self):
+        if self._last_cursor_xy is None:
+            self._hide_brush_cursor()
+            return
+        self._update_brush_cursor(*self._last_cursor_xy)
+
+    def _update_brush_cursor(self, cx, cy):
+        self._hide_brush_cursor()
+        self._last_cursor_xy = (cx, cy)
+        mode = self._canvas_mode_var.get()
+        if mode == "Points" or not self._render_info:
+            return
+
+        _mx, _my, panel_idx = self._canvas_to_target(cx, cy)
+        if panel_idx is None:
+            return
+        if panel_idx != 0 and not self._is_cleaned_panel(panel_idx):
+            return
+
+        brush_px = max(1, int(self._brush_var.get())) * self._render_info["scale"]
+        radius = max(2.0, brush_px / 2)
+        x0, y0 = cx - radius, cy - radius
+        x1, y1 = cx + radius, cy + radius
+        self._brush_cursor_ids = [
+            self._canvas.create_oval(
+                x0,
+                y0,
+                x1,
+                y1,
+                outline="white",
+                width=3,
+            ),
+            self._canvas.create_oval(
+                x0,
+                y0,
+                x1,
+                y1,
+                outline="black",
+                width=1,
+            ),
+        ]
+
+    def _zoom_in(self):
+        self._set_zoom(self._zoom * 1.2, self._canvas_center())
+
+    def _zoom_out(self):
+        self._set_zoom(self._zoom / 1.2, self._canvas_center())
+
+    def _reset_zoom(self):
+        self._zoom = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._render_to_canvas()
+
+    def _canvas_center(self):
+        return (self._canvas.winfo_width() / 2, self._canvas.winfo_height() / 2)
+
+    def _on_mouse_wheel(self, event):
+        if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+            factor = 1.15
+        else:
+            factor = 1 / 1.15
+        self._set_zoom(self._zoom * factor, (event.x, event.y))
+        return "break"
+
+    def _set_zoom(self, zoom: float, anchor=None):
+        if self._current_rgb is None:
+            return
+
+        old_info = self._render_info
+        old_zoom = self._zoom
+        self._zoom = max(0.25, min(8.0, float(zoom)))
+        if abs(self._zoom - old_zoom) < 0.001:
+            return
+
+        if anchor and old_info:
+            ax, ay = anchor
+            image_x = (ax - old_info["ox"]) / old_info["scale"]
+            image_y = (ay - old_info["oy"]) / old_info["scale"]
+            ih, iw = self._current_rgb.shape[:2]
+            if 0 <= image_x < iw and 0 <= image_y < ih:
+                cw = self._canvas.winfo_width()
+                ch = self._canvas.winfo_height()
+                base_scale = min(cw / iw, ch / ih)
+                new_scale = base_scale * self._zoom
+                self._pan_x = ax + (iw / 2 - image_x) * new_scale - cw / 2
+                self._pan_y = ay + (ih / 2 - image_y) * new_scale - ch / 2
+
+        self._render_to_canvas()
+
+    def _on_pan_start(self, event):
+        self._pan_start = (event.x, event.y, self._pan_x, self._pan_y)
+        self._hide_brush_cursor(event)
+        self._canvas.configure(cursor="fleur")
+
+    def _on_pan_drag(self, event):
+        if self._pan_start is None:
+            return
+        start_x, start_y, start_pan_x, start_pan_y = self._pan_start
+        self._pan_x = start_pan_x + event.x - start_x
+        self._pan_y = start_pan_y + event.y - start_y
+        self._render_to_canvas()
+
+    def _on_pan_end(self, event):
+        self._pan_start = None
+        self._canvas.configure(cursor="")
+
+    def _canvas_to_target(self, cx, cy):
         if not self._render_info or self._original is None:
-            return None, None
+            return None, None, None
         r = self._render_info
         ix = cx - r["ox"]
         iy = cy - r["oy"]
         if ix < 0 or iy < 0 or ix >= r["nw"] or iy >= r["nh"]:
-            return None, None
+            return None, None, None
         mx = int(ix / r["scale"])
         my = int(iy / r["scale"])
         orig_w = self._original.shape[1]
+        panel_idx = 0
         if r["orig_w"] > orig_w:
             panel_span = orig_w + 20
+            panel_idx = int(mx // panel_span)
             panel_x = mx % panel_span
             if panel_x >= orig_w:
-                return None, None
+                return None, None, None
             mx = panel_x
         mx = max(0, min(mx, orig_w - 1))
         my = max(0, min(my, self._original.shape[0] - 1))
+        return mx, my, panel_idx
+
+    def _canvas_to_map(self, cx, cy):
+        mx, my, _panel_idx = self._canvas_to_target(cx, cy)
         return mx, my
 
+    def _is_cleaned_panel(self, panel_idx):
+        if self._cleaned is None:
+            return False
+        if not self._show_comparison_preview():
+            return True
+        return panel_idx == 2
+
+    def _output_value_for_mode(self, mode):
+        if mode == "Black":
+            return OCCUPIED
+        if mode in ("Erase line", "Gray"):
+            return UNKNOWN
+        if mode == "White":
+            return FREE
+        return None
+
     def _on_mouse_move(self, event):
+        self._update_brush_cursor(event.x, event.y)
         mx, my = self._canvas_to_map(event.x, event.y)
         if mx is not None:
             self._coord_label.configure(text=f"x={mx}  y={my}")
 
     def _on_canvas_click(self, event):
-        mx, my = self._canvas_to_map(event.x, event.y)
+        self._update_brush_cursor(event.x, event.y)
+        mx, my, panel_idx = self._canvas_to_target(event.x, event.y)
         if mx is None:
             return
 
         mode = self._canvas_mode_var.get()
+        if self._is_cleaned_panel(panel_idx):
+            value = self._output_value_for_mode(mode)
+            if value is not None:
+                self._paint_output(mx, my, value)
+            return
+
+        if panel_idx != 0:
+            return
+
         if mode == "Points":
             self._add_point(mx, my)
             return
@@ -796,16 +1090,24 @@ class MapCleanerApp(ctk.CTk):
         elif mode == "White":
             self._paint_manual_free(mx, my)
         else:
-            self._paint_manual_wall(mx, my, erase=(mode == "Unpaint"))
+            self._paint_manual_wall(mx, my, erase=(mode == "Erase line"))
 
     def _on_canvas_drag(self, event):
         mode = self._canvas_mode_var.get()
-        if mode == "Points":
-            return
+        self._update_brush_cursor(event.x, event.y)
 
-        mx, my = self._canvas_to_map(event.x, event.y)
+        mx, my, panel_idx = self._canvas_to_target(event.x, event.y)
         if mx is None:
             self._last_paint_xy = None
+            return
+
+        if self._is_cleaned_panel(panel_idx):
+            value = self._output_value_for_mode(mode)
+            if value is not None:
+                self._paint_output(mx, my, value)
+            return
+
+        if mode == "Points" or panel_idx != 0:
             return
 
         if mode == "Gray":
@@ -813,7 +1115,7 @@ class MapCleanerApp(ctk.CTk):
         elif mode == "White":
             self._paint_manual_free(mx, my)
         else:
-            self._paint_manual_wall(mx, my, erase=(mode == "Unpaint"))
+            self._paint_manual_wall(mx, my, erase=(mode == "Erase line"))
 
     def _on_canvas_release(self, event):
         self._last_paint_xy = None
