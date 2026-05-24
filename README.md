@@ -86,6 +86,10 @@ free_thresh: 0.196
 
 The cleaned map is saved as a single grayscale PNG.
 
+Synthetic noisy test maps are included in `src/maps/synthetic_noisy_tests/`.
+Load one of the YAML files from that folder to test broken borders, outside
+speckles, disconnected islands, scan artifacts, and pixelated walls.
+
 ## GUI Functionality
 
 The app is split into a control panel on the left and a map preview on the right.
@@ -158,7 +162,7 @@ Low values create thin walls. High values create heavier boundaries. The high-th
 
 ### Wall Smoothing
 
-`Wall smoothing (sigma)` controls how much the generated wall outline is smoothed.
+`Wall smoothing` controls how much the generated wall outline is smoothed.
 
 Low smoothing keeps the wall close to the raw pixel boundary, which can look stair-stepped or jagged. The low-thickness, low-smoothness screenshot shows a thinner wall with more visible pixelation.
 
@@ -180,7 +184,18 @@ Lower values preserve more small details. Higher values remove or fill larger sm
 
 ### Run
 
-`Run` sends the loaded map and prompt points through MobileSAM, then converts the resulting mask into a cleaned occupancy map. At least one prompt point is required.
+`Run` sends the loaded map and prompt points through MobileSAM, automatically picks the best mask candidate for the prompt points, then converts that mask into a cleaned occupancy map. At least one prompt point is required.
+
+The SAM mask defines the outer body of the cleaned map. Original-map structures
+can create inner walls or obstacles only when they are fully internal to that
+SAM-selected body. Structures connected to the selected body's outside edge are
+treated as border/noise evidence and cannot carve away large pieces of the SAM
+mask.
+
+The cleaner may use temporary closure lines while processing broken borders, but
+the final outer wall is only drawn where the original map had nearby dark wall
+evidence. Gaps that were open in the original map, including black helper lines
+painted only to guide processing, should remain open in the saved output.
 
 If you run once, adjust only processing controls such as `Wall thickness`,
 `Wall smoothing`, or `Min noise dot area`, and run again, the SAM mask will

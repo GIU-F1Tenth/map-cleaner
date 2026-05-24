@@ -11,7 +11,21 @@ import customtkinter as ctk
 import numpy as np
 from PIL import Image, ImageTk
 
-from config import MAPS_DIR, OUTPUT_DIR, SHOW_COMPARISON_PREVIEW
+from config import (
+    BRUSH_SIZE_DEFAULT,
+    BRUSH_SIZE_MAX,
+    BRUSH_SIZE_MIN,
+    MAPS_DIR,
+    OUTPUT_DIR,
+    SHOW_COMPARISON_PREVIEW,
+    WALL_SMOOTHING_DEFAULT,
+    WALL_SMOOTHING_MAX,
+    WALL_SMOOTHING_MIN,
+    WALL_SMOOTHING_STEPS,
+    WALL_THICKNESS_DEFAULT,
+    WALL_THICKNESS_MAX,
+    WALL_THICKNESS_MIN,
+)
 from map_io import build_comparison_image, load_map, pgm_to_rgb, save_map
 from processing import (
     FREE,
@@ -38,6 +52,20 @@ POINT_COLOURS = [
     "#00acc1",
     "#7cb342",
 ]
+
+BRUSH_MIN = max(1, int(BRUSH_SIZE_MIN))
+BRUSH_MAX = max(BRUSH_MIN + 1, int(BRUSH_SIZE_MAX))
+BRUSH_DEFAULT = min(max(int(BRUSH_SIZE_DEFAULT), BRUSH_MIN), BRUSH_MAX)
+WALL_MIN = max(1, int(WALL_THICKNESS_MIN))
+WALL_MAX = max(WALL_MIN + 1, int(WALL_THICKNESS_MAX))
+WALL_DEFAULT = min(max(int(WALL_THICKNESS_DEFAULT), WALL_MIN), WALL_MAX)
+SMOOTHING_MIN = float(WALL_SMOOTHING_MIN)
+SMOOTHING_MAX = max(SMOOTHING_MIN, float(WALL_SMOOTHING_MAX))
+SMOOTHING_STEPS = max(1, int(WALL_SMOOTHING_STEPS))
+SMOOTHING_DEFAULT = min(
+    max(float(WALL_SMOOTHING_DEFAULT), SMOOTHING_MIN), SMOOTHING_MAX
+)
+MIN_NOISE_DOT_AREA_DEFAULT = 500
 
 
 class MapCleanerApp(ctk.CTk):
@@ -73,6 +101,7 @@ class MapCleanerApp(ctk.CTk):
         self._last_cursor_xy = None
         self._preview_mode_var = None
         self._show_comparison = SHOW_COMPARISON_PREVIEW
+        self._run_generation = 0
 
         self._build_ui()
 
@@ -163,20 +192,20 @@ class MapCleanerApp(ctk.CTk):
         ctk.CTkLabel(left, text="Brush size (px)", font=FONT).pack(
             anchor="w", padx=16, pady=(0, 2)
         )
-        self._brush_var = ctk.IntVar(value=2)
+        self._brush_var = ctk.IntVar(value=BRUSH_DEFAULT)
         brush_row = ctk.CTkFrame(left, fg_color="transparent")
         brush_row.pack(fill="x", padx=16, pady=(0, 8))
         self._brush_slider = ctk.CTkSlider(
             brush_row,
-            from_=1,
-            to=10,
-            number_of_steps=9,
+            from_=BRUSH_MIN,
+            to=BRUSH_MAX,
+            number_of_steps=BRUSH_MAX - BRUSH_MIN,
             variable=self._brush_var,
             command=self._on_brush_change,
         )
         self._brush_slider.pack(side="left", fill="x", expand=True)
         self._brush_label = ctk.CTkLabel(
-            brush_row, text="2", font=FONT_SMALL, width=32
+            brush_row, text=str(BRUSH_DEFAULT), font=FONT_SMALL, width=32
         )
         self._brush_label.pack(side="left", padx=(8, 0))
 
@@ -213,39 +242,41 @@ class MapCleanerApp(ctk.CTk):
         ctk.CTkLabel(left, text="Wall thickness (px)", font=FONT).pack(
             anchor="w", padx=16, pady=(10, 2)
         )
-        self._wall_var = ctk.IntVar(value=2)
+        self._wall_var = ctk.IntVar(value=WALL_DEFAULT)
         wall_row = ctk.CTkFrame(left, fg_color="transparent")
         wall_row.pack(fill="x", padx=16, pady=(0, 10))
         self._wall_slider = ctk.CTkSlider(
             wall_row,
-            from_=1,
-            to=8,
-            number_of_steps=7,
+            from_=WALL_MIN,
+            to=WALL_MAX,
+            number_of_steps=WALL_MAX - WALL_MIN,
             variable=self._wall_var,
             command=self._on_wall_change,
         )
         self._wall_slider.pack(side="left", fill="x", expand=True)
-        self._wall_label = ctk.CTkLabel(wall_row, text="2", font=FONT_SMALL, width=24)
+        self._wall_label = ctk.CTkLabel(
+            wall_row, text=str(WALL_DEFAULT), font=FONT_SMALL, width=24
+        )
         self._wall_label.pack(side="left", padx=(8, 0))
 
         # smoothing
-        ctk.CTkLabel(left, text="Wall smoothing (sigma)", font=FONT).pack(
+        ctk.CTkLabel(left, text="Wall smoothing", font=FONT).pack(
             anchor="w", padx=16, pady=(10, 2)
         )
-        self._sigma_var = ctk.DoubleVar(value=3.0)
+        self._sigma_var = ctk.DoubleVar(value=SMOOTHING_DEFAULT)
         sigma_row = ctk.CTkFrame(left, fg_color="transparent")
         sigma_row.pack(fill="x", padx=16, pady=(0, 6))
         self._sigma_slider = ctk.CTkSlider(
             sigma_row,
-            from_=0.5,
-            to=8.0,
-            number_of_steps=15,
+            from_=SMOOTHING_MIN,
+            to=SMOOTHING_MAX,
+            number_of_steps=SMOOTHING_STEPS,
             variable=self._sigma_var,
             command=self._on_sigma_change,
         )
         self._sigma_slider.pack(side="left", fill="x", expand=True)
         self._sigma_label = ctk.CTkLabel(
-            sigma_row, text="3.0", font=FONT_SMALL, width=30
+            sigma_row, text=f"{SMOOTHING_DEFAULT:.1f}", font=FONT_SMALL, width=30
         )
         self._sigma_label.pack(side="left", padx=(8, 0))
 
@@ -253,7 +284,7 @@ class MapCleanerApp(ctk.CTk):
         ctk.CTkLabel(left, text="Min noise dot area (px)", font=FONT).pack(
             anchor="w", padx=16, pady=(4, 2)
         )
-        self._hole_var = ctk.IntVar(value=500)
+        self._hole_var = ctk.IntVar(value=MIN_NOISE_DOT_AREA_DEFAULT)
         hole_row = ctk.CTkFrame(left, fg_color="transparent")
         hole_row.pack(fill="x", padx=16, pady=(0, 10))
         self._hole_slider = ctk.CTkSlider(
@@ -265,7 +296,9 @@ class MapCleanerApp(ctk.CTk):
             command=self._on_hole_change,
         )
         self._hole_slider.pack(side="left", fill="x", expand=True)
-        self._hole_label = ctk.CTkLabel(hole_row, text="500", font=FONT_SMALL, width=40)
+        self._hole_label = ctk.CTkLabel(
+            hole_row, text=str(MIN_NOISE_DOT_AREA_DEFAULT), font=FONT_SMALL, width=40
+        )
         self._hole_label.pack(side="left", padx=(8, 0))
 
         _sep(left)
@@ -512,7 +545,7 @@ class MapCleanerApp(ctk.CTk):
         update_last=True,
         start_point=None,
     ):
-        brush = max(1, int(self._brush_var.get()))
+        brush = self._brush_size()
         point = (int(mx), int(my))
         start = point if start_point is None else start_point
         cv2.line(mask, start, point, value, brush, lineType=cv2.LINE_8)
@@ -717,6 +750,9 @@ class MapCleanerApp(ctk.CTk):
         self._brush_label.configure(text=str(int(float(val))))
         self._redraw_brush_cursor()
 
+    def _brush_size(self):
+        return min(max(int(self._brush_var.get()), BRUSH_MIN), BRUSH_MAX)
+
     def _on_preview_mode_change(self, mode=None):
         if mode is None and self._preview_mode_var is not None:
             mode = self._preview_mode_var.get()
@@ -769,13 +805,17 @@ class MapCleanerApp(ctk.CTk):
         )
         if not path:
             return
-        self._yaml_path = Path(path)
-        self._file_label.configure(text=self._yaml_path.name, text_color="white")
+        yaml_path = Path(path)
         try:
-            self._original, self._meta = load_map(self._yaml_path)
+            original, meta = load_map(yaml_path)
         except Exception as e:
             self._status.configure(text=f"Error: {e}")
             return
+        self._yaml_path = yaml_path
+        self._original = original
+        self._meta = meta
+        self._file_label.configure(text=self._yaml_path.name, text_color="white")
+        self._run_generation += 1
         self._track_mask = None
         self._cleaned = None
         self._manual_walls = np.zeros_like(self._original, dtype=np.uint8)
@@ -790,13 +830,30 @@ class MapCleanerApp(ctk.CTk):
         self._pan_x = 0.0
         self._pan_y = 0.0
         self._pan_start = None
+        self._render_info = None
+        self._last_cursor_xy = None
+        self._hide_brush_cursor()
         self._points.clear()
         self._rebuild_points_ui()
+        self._canvas_mode_var.set("Points")
+        self._brush_var.set(BRUSH_DEFAULT)
+        self._brush_label.configure(text=str(BRUSH_DEFAULT))
+        self._wall_var.set(WALL_DEFAULT)
+        self._wall_label.configure(text=str(WALL_DEFAULT))
+        self._sigma_var.set(SMOOTHING_DEFAULT)
+        self._sigma_label.configure(text=f"{SMOOTHING_DEFAULT:.1f}")
+        self._hole_var.set(MIN_NOISE_DOT_AREA_DEFAULT)
+        self._hole_label.configure(text=str(MIN_NOISE_DOT_AREA_DEFAULT))
+        self._show_comparison = SHOW_COMPARISON_PREVIEW
+        if self._preview_mode_var is not None:
+            preview_mode = "3 images" if SHOW_COMPARISON_PREVIEW else "Result only"
+            self._preview_mode_var.set(preview_mode)
         self._current_rgb = cv2.cvtColor(self._original, cv2.COLOR_GRAY2RGB)
         self._render_to_canvas()
-        self._run_btn.configure(state="normal")
+        self._run_btn.configure(state="normal", text="▶  Run")
         self._save_btn.configure(state="disabled")
         self._stats_label.configure(text="")
+        self._coord_label.configure(text="")
         self._status.configure(
             text=f"{self._original.shape[1]}×{self._original.shape[0]} px"
         )
@@ -808,38 +865,56 @@ class MapCleanerApp(ctk.CTk):
             self._status.configure(text="Add at least one point first.")
             return
 
-        self._run_btn.configure(state="disabled", text="Running…")
-        self._status.configure(text="Loading MobileSAM…")
+        self._run_btn.configure(state="disabled", text="Running...")
+        self._status.configure(text="Loading MobileSAM...")
+        generation = self._run_generation
+        original = self._original.copy()
+        image_for_sam = self._original_with_manual_edits()
+        points = list(self._points)
+        manual_walls = self._manual_walls.copy()
+        manual_unknown = self._manual_unknown.copy()
+        manual_free = self._manual_free.copy()
+        wall_thickness = self._wall_var.get()
+        wall_smoothing = self._sigma_var.get()
+        min_noise_area = self._hole_var.get()
 
         def worker():
             try:
                 if self._sam_model is None:
                     self._sam_model = init_sam()
-                self._status.configure(text="Segmenting…")
-                image_rgb = pgm_to_rgb(self._original_with_manual_edits())
-                mask = segment_points(self._sam_model, image_rgb, self._points)
-                mask = resize_mask_to(mask, self._original.shape)
-                cleaned, fitted_mask = derive_occupancy_grid_and_mask(
+                self.after(0, self._set_status_if_generation, generation, "Segmenting...")
+                image_rgb = pgm_to_rgb(image_for_sam)
+                mask = segment_points(self._sam_model, image_rgb, points)
+                mask = resize_mask_to(mask, original.shape)
+                display_mask = mask.copy()
+                cleaned, _processed_mask = derive_occupancy_grid_and_mask(
                     mask,
-                    self._original,
-                    self._wall_var.get(),
-                    self._sigma_var.get(),
-                    self._hole_var.get(),
-                    self._manual_walls,
-                    self._manual_unknown,
-                    self._manual_free,
-                    self._points,
+                    original,
+                    wall_thickness,
+                    wall_smoothing,
+                    min_noise_area,
+                    manual_walls,
+                    manual_unknown,
+                    manual_free,
+                    points,
                 )
-                self.after(0, self._on_done, fitted_mask, cleaned)
+                self.after(0, self._on_done, generation, display_mask, cleaned)
             except Exception as e:
                 import traceback
 
                 traceback.print_exc()
-                self.after(0, self._on_error, str(e))
+                self.after(0, self._on_error, generation, str(e))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_done(self, mask, cleaned):
+    def _set_status_if_generation(self, generation, text):
+        if generation == self._run_generation:
+            self._status.configure(text=text)
+
+    def _on_done(self, generation, mask, cleaned):
+        if generation != self._run_generation:
+            return
+
         self._track_mask = mask
         self._cleaned = cleaned
         self._output_white = np.zeros_like(cleaned, dtype=np.uint8)
@@ -861,7 +936,10 @@ class MapCleanerApp(ctk.CTk):
         )
         self._status.configure(text="Done — review then save.")
 
-    def _on_error(self, msg):
+    def _on_error(self, generation, msg):
+        if generation != self._run_generation:
+            return
+
         self._run_btn.configure(state="normal", text="▶  Run")
         self._status.configure(text=f"Error: {msg[:120]}")
         from tkinter import messagebox
@@ -1032,7 +1110,7 @@ class MapCleanerApp(ctk.CTk):
         if self._is_cleaned_panel(panel_idx) and not self._can_edit_cleaned_panel(mode):
             return
 
-        brush_px = max(1, int(self._brush_var.get())) * self._render_info["scale"]
+        brush_px = self._brush_size() * self._render_info["scale"]
         radius = max(2.0, brush_px / 2)
         x0, y0 = cx - radius, cy - radius
         x1, y1 = cx + radius, cy + radius

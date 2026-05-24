@@ -1,0 +1,7 @@
+image: noisy_track_thin_pixelated_walls.pgm
+resolution: 0.05
+origin: [0.0, 0.0, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
+description: "Thin pixelated walls with interior pits and dense black speckles."

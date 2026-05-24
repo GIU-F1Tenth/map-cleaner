@@ -58,6 +58,7 @@ def derive_occupancy_grid_and_mask(
       - everything else → UNKNOWN  (205)
     """
     track_mask = np.ascontiguousarray((track_mask > 0).astype(np.uint8))
+    _force_seed_points_into_mask(track_mask, seed_points)
     original_gray = _as_gray(original)
     manual_wall_mask = _as_mask(manual_walls, original_gray.shape)
     manual_unknown_mask = _as_mask(manual_unknown, original_gray.shape)
@@ -88,13 +89,8 @@ def derive_occupancy_grid_and_mask(
         if stats[label, cv2.CC_STAT_AREA] < min_hole_area:
             cleaned_mask[labels == label] = 1
 
-    # keep only the largest free region
-    num_labels2, labels2, stats2, _ = cv2.connectedComponentsWithStats(
-        cleaned_mask, connectivity=8
-    )
-    if num_labels2 > 1:
-        largest = 1 + int(np.argmax(stats2[1:, cv2.CC_STAT_AREA]))
-        cleaned_mask = (labels2 == largest).astype(np.uint8)
+    # keep seeded regions when prompts identify multiple connected components
+    cleaned_mask = _keep_seeded_or_largest_component(cleaned_mask, seed_points)
 
     smooth_mask = cleaned_mask.copy()
 
@@ -103,10 +99,14 @@ def derive_occupancy_grid_and_mask(
     )
     outside = _outside_reachable_from_edges(cleanup_barrier)
     inside_mask = ((smooth_mask == 1) & (outside == 0)).astype(np.uint8)
-    min_inside_count = max(10, int(np.count_nonzero(smooth_mask) * 0.1))
-    if np.count_nonzero(inside_mask) < min_inside_count:
+    smooth_count = int(np.count_nonzero(smooth_mask))
+    inside_count = int(np.count_nonzero(inside_mask))
+    min_inside_count = max(10, int(smooth_count * 0.1))
+    min_retained_count = int(smooth_count * 0.75)
+    if inside_count < max(min_inside_count, min_retained_count):
         inside_mask = smooth_mask.copy()
 
+    _force_seed_points_into_mask(inside_mask, seed_points)
     inside_mask = _keep_seeded_or_largest_component(inside_mask, seed_points)
 
     preserved_structures = _final_preserved_structures(
@@ -114,6 +114,7 @@ def derive_occupancy_grid_and_mask(
     )
     final_free = ((inside_mask == 1) & (preserved_structures == 0)).astype(np.uint8)
     final_free[manual_free_mask == 1] = 1
+    _force_seed_points_into_mask(final_free, seed_points)
     final_free = _keep_seeded_or_largest_component(final_free, seed_points)
     helper_fill_zone = _helper_fill_zone(helper_clearance, final_free, smooth_mask)
     final_free[helper_fill_zone == 1] = 1
@@ -121,6 +122,9 @@ def derive_occupancy_grid_and_mask(
 
     # wall boundary ring
     wall = _wall_from_free_mask(final_free, wall_thickness, smooth_sigma)
+    wall = _remove_unsupported_outer_wall(
+        wall, final_free, original_gray, manual_wall_mask, wall_thickness
+    )
     k_size = wall_thickness * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
     preserved_clearance = cv2.dilate(preserved_structures, kernel, iterations=1)
@@ -192,20 +196,30 @@ def _keep_seeded_or_largest_component(
                 counts = np.bincount(nearby)
                 seed_labels.append(int(np.argmax(counts)))
 
+    keep = np.zeros_like(mask, dtype=np.uint8)
     if seed_labels:
-        counts = np.bincount(seed_labels, minlength=num_labels)
-        best_count = np.max(counts[1:])
-        candidates = np.flatnonzero(counts == best_count)
-        candidates = candidates[candidates > 0]
-        selected_label = max(
-            candidates, key=lambda label: stats[label, cv2.CC_STAT_AREA]
-        )
+        for label in set(seed_labels):
+            keep[labels == label] = 1
     else:
         selected_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-
-    keep = np.zeros_like(mask, dtype=np.uint8)
-    keep[labels == selected_label] = 1
+        keep[labels == selected_label] = 1
     return keep
+
+
+def _force_seed_points_into_mask(
+    mask: np.ndarray,
+    seed_points: Sequence[tuple[int, int]] | None,
+    radius: int = 3,
+) -> None:
+    if not seed_points:
+        return
+
+    h, w = mask.shape[:2]
+    for x, y in seed_points:
+        x = int(x)
+        y = int(y)
+        if 0 <= x < w and 0 <= y < h:
+            cv2.circle(mask, (x, y), radius, 1, thickness=-1)
 
 
 def _wall_from_free_mask(
@@ -240,6 +254,38 @@ def _wall_from_free_mask(
 
     wall[free_mask == 1] = 0
     return wall.astype(np.uint8)
+
+
+def _remove_unsupported_outer_wall(
+    wall: np.ndarray,
+    free_mask: np.ndarray,
+    original: np.ndarray,
+    manual_walls: np.ndarray,
+    wall_thickness: int,
+    evidence_threshold: int = 96,
+) -> np.ndarray:
+    """
+    Prevent the generated outer wall from closing gaps that were open originally.
+
+    SAM defines the body, but the final outer border should only be drawn where
+    the original map had nearby wall evidence. Manually painted helper walls are
+    excluded so they can close the mask during processing without appearing in
+    the saved result.
+    """
+    wall = (wall == 1).astype(np.uint8)
+    if np.count_nonzero(wall) == 0:
+        return wall
+
+    original_wall = ((original <= evidence_threshold) & (manual_walls == 0)).astype(
+        np.uint8
+    )
+    radius = max(2, min(8, wall_thickness + 2))
+    k_size = radius * 2 + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+    supported_wall = cv2.dilate(original_wall, kernel, iterations=1)
+    outer_wall = ((wall == 1) & (_exterior_band(free_mask) == 1)).astype(np.uint8)
+    wall[(outer_wall == 1) & (supported_wall == 0)] = 0
+    return wall
 
 
 def _smooth_contour_points(contour: np.ndarray, window: int) -> np.ndarray:
@@ -351,7 +397,7 @@ def _final_preserved_structures(
     keep = np.zeros_like(candidate_mask, dtype=np.uint8)
     interior = candidate_mask == 1
     deep_interior = _eroded_interior(candidate_mask)
-    exterior_band = _exterior_band(candidate_mask)
+    outer_boundary_band = _exterior_band(candidate_mask)
 
     for label in range(1, num_labels):
         component = labels == label
@@ -359,13 +405,13 @@ def _final_preserved_structures(
             continue
         if not np.any(component & interior):
             continue
+        # Components connected to the SAM mask's outside edge are part of the
+        # outer border/noise model. They must not carve away the chosen body.
+        if np.any(component & (outer_boundary_band == 1)):
+            continue
         deep_count = int(np.count_nonzero(component & (deep_interior == 1)))
         if deep_count == 0:
             continue
-        if np.any(component & (exterior_band == 1)):
-            min_deep_count = max(10, int(stats[label, cv2.CC_STAT_AREA] * 0.75))
-            if deep_count < min_deep_count:
-                continue
         keep[component] = 1
 
     return keep
