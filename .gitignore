@@ -1,3 +1,4 @@
 /map-cleaner
-src\__pycache__
+__pycache__/
+*.py[cod]
 mobile_sam.pt
