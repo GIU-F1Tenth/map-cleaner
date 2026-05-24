@@ -182,6 +182,12 @@ Lower values preserve more small details. Higher values remove or fill larger sm
 
 `Run` sends the loaded map and prompt points through MobileSAM, then converts the resulting mask into a cleaned occupancy map. At least one prompt point is required.
 
+If you run once, adjust only processing controls such as `Wall thickness`,
+`Wall smoothing`, or `Min noise dot area`, and run again, the SAM mask will
+usually stay the same because the prompt points and original/helper-edited image
+are unchanged. The cleaned output can still change because those controls are
+applied after SAM creates the mask.
+
 The first run may take longer because the MobileSAM weights are downloaded automatically if they are not already present in `src/models/`.
 
 ### Save Map
