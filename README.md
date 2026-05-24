@@ -84,7 +84,7 @@ occupied_thresh: 0.65
 free_thresh: 0.196
 ```
 
-The cleaned map is saved as a PNG with a matching YAML file. A separate preview PNG is also written.
+The cleaned map is saved as a single grayscale PNG.
 
 ## GUI Functionality
 
@@ -186,11 +186,7 @@ The first run may take longer because the MobileSAM weights are downloaded autom
 
 ### Save Map
 
-`Save map` writes three files:
-
-- the cleaned map image as a PNG
-- a matching YAML file that points to the cleaned PNG
-- a preview PNG showing the current preview layout
+`Save map` writes only the cleaned grayscale PNG. It does not create a YAML file or a preview image.
 
 The saved occupancy map uses standard grayscale occupancy values: free space, occupied walls, and unknown/background.
 

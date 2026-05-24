@@ -883,16 +883,12 @@ class MapCleanerApp(ctk.CTk):
         if not path:
             return
         out_image = Path(path)
-        out_yaml = out_image.with_suffix(".yaml")
-        out_preview = out_image.with_name(out_image.stem + "_preview.png")
-        save_map(self._cleaned, self._meta, out_image, out_yaml)
-        comparison = self._build_current_preview_image()
-        cv2.imwrite(str(out_preview), comparison)
+        save_map(self._cleaned, out_image)
         self._status.configure(text=f"Saved to {out_image.parent}")
         from tkinter import messagebox
 
         messagebox.showinfo(
-            "Saved", f"Saved:\n  {out_image.name}\n  {out_yaml.name}\n  {out_preview.name}"
+            "Saved", f"Saved:\n  {out_image.name}"
         )
 
     # ── preview ───────────────────────────────────────────────────────────────
